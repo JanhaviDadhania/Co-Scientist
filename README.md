@@ -117,6 +117,23 @@ co-scientist run "Identify hypotheses about microbiome-driven inflammation" \
 
 This kicks off Generation → Reflection → Ranking → Evolution → Meta-review under the configured LLM provider. The Supervisor schedules tasks, the Elo tournament refines a leaderboard, and the final research overview is written to `data/artifacts/<session_id>/final/overview.md`.
 
+### Seeding Generation with a pre-curated field survey (`--field-context`)
+
+When you already have a literature survey for the field (e.g. a STORM-generated wiki page), point Generation at it so the agent isn't restarting from cold search every time:
+
+```bash
+co-scientist run "test SAEs as a way to interpret neural networks" \
+  --field-context path/to/sae_survey.md \
+  --n 3 --budget-usd 2.0 --wall-clock 900
+```
+
+What this does:
+- Loads the file once at session start and stores its text on `cfg.run.field_context`.
+- Prepends its contents to the user_blocks of every Generation call, wrapped in instructions that mark the survey as **required reading** and frame the literature search tools (`pubmed_search`, `arxiv_search`, `europe_pmc_search`, `web_search`, `web_fetch`) as **fallback-only** — they should be used to fill specific gaps the survey leaves open, not to duplicate work the survey already did.
+- Does not affect Reflection / Ranking / Evolution / Metareview — they operate on the hypotheses Generation produces.
+
+Caveats: the survey is re-sent on every tool-loop iteration of every Generation call (no cross-call caching on `claude_code`). Long surveys (>10k tokens) noticeably slow each call. If your survey is very long, trim to abstract + section TOC + key references before passing it in.
+
 ```bash
 co-scientist serve            # FastAPI + htmx + SSE dashboard at localhost:7878
 co-scientist report <id>      # print the final overview
@@ -161,6 +178,7 @@ Providers are listed alphabetically — none is preferred; pick whichever you ha
 | provider              | Endpoint                                                | API-key env var         | Example models                                            |
 | --------------------- | ------------------------------------------------------- | ----------------------- | --------------------------------------------------------- |
 | `anthropic`           | api.anthropic.com                                       | `ANTHROPIC_API_KEY`     | `claude-opus-4-7`, `claude-sonnet-4-6`                    |
+| `claude_code`         | local `claude -p` subprocess (Claude Code CLI)          | *(none — uses your Claude Code subscription)* | `sonnet`, `opus`, `haiku` (aliases) or full ids |
 | `gemini` / `google`   | generativelanguage.googleapis.com (OpenAI-compat)       | `GEMINI_API_KEY`        | `gemini-2.5-pro`, `gemini-2.5-flash`                      |
 | `groq`                | api.groq.com                                            | `GROQ_API_KEY`          | `llama-3.3-70b-versatile`, `mixtral-8x7b-32768`           |
 | `mistral`             | api.mistral.ai                                          | `MISTRAL_API_KEY`       | `mistral-large-latest`, `codestral-latest`                |
@@ -202,6 +220,119 @@ Cost is estimated via `co_scientist/llm/routing.py`'s `PRICE_TABLE`; unknown mod
 | Batch API (50%-off ranking) | ✅          | ❌ (Anthropic-only; other providers run all matches synchronously) |
 
 > Note: the reasoning-model check is a name heuristic ([`openai_client.py`](co_scientist/llm/openai_client.py) `_is_reasoning_model`). Newer reasoning-capable models whose ids don't match the pattern (e.g. `gpt-5`) won't get `reasoning_effort` until the heuristic is updated — they still work, just without an explicit reasoning budget.
+
+### Using the local Claude Code CLI (`claude_code` provider)
+
+`provider = "claude_code"` routes every LLM call through `claude -p` instead of an API. The benefit is that you pay zero per-call API cost — calls go through your Claude Code subscription's quota. The cost is that you give up the things only the Anthropic API exposes (real tool-use mechanism, prompt caching, batch API, extended-thinking budgets).
+
+```toml
+[llm]
+provider = "claude_code"
+
+[run]
+concurrency = 1            # serialize subprocesses to avoid Claude Code throttling
+budget_usd = 100.0         # effectively disabled — wall-clock terminates instead
+
+[models]                   # Claude Code aliases or full ids
+parse_goal          = "sonnet"
+generation          = "sonnet"
+reflection          = "sonnet"
+evolution           = "sonnet"
+ranking_pairwise    = "sonnet"
+ranking_debate      = "sonnet"
+ranking_priority    = "sonnet"
+metareview_feedback = "sonnet"
+metareview_final    = "sonnet"
+classifier          = "haiku"
+judge               = "sonnet"
+
+[thinking]                 # claude -p has no `thinking` budget knob — zero them
+generation_literature   = 0
+generation_debate       = 0
+reflection_full         = 0
+reflection_verification = 0
+reflection_observation  = 0
+ranking_pairwise        = 0
+ranking_debate          = 0
+evolution_combine       = 0
+evolution_out_of_box    = 0
+evolution_feasibility   = 0
+evolution_simplify      = 0
+metareview_feedback     = 0
+metareview_final        = 0
+```
+
+Notes on the trade-offs:
+
+- **Tool calls are simulated, not enforced.** The Anthropic API guarantees structured `tool_use` output when you pass `tool_choice`. `claude -p` has no such mechanism — the shim prompts the model to emit `{"tool_calls": [...]}` JSON in its stdout and parses it. Most of the time this works; sometimes the model returns prose and the supervisor falls back gracefully (you'll see warnings like `parse_goal_no_record`).
+- **Subprocess cold-start is ~3–5s per call.** Concurrent `claude -p` invocations also appear to throttle against each other on the same Claude Code account, so concurrency=1 is the safe default. Per-call timeout defaults to 400s (`CLAUDE_CODE_TIMEOUT_S` env var to override).
+- **Cost accounting still runs.** `cost_usd` in transcripts is the rough API-equivalent estimate using the existing PRICE_TABLE — useful as a proxy for "what this would have cost on the API", not what your subscription was actually billed.
+
+#### The Write-tool safety net for forced tool calls
+
+For *forced* tool calls (`tool_choice = {"type": "tool", "name": X}` — used for `parse_goal`'s `record_research_plan`, and for the last-iteration forced terminal tool in the Generation / Reflection / Evolution loops), the shim opens a per-call tempfile at `/tmp/co_scientist_call_<uuid>.json` and instructs the model in the system prompt to *use the Claude Code Write tool* to drop the JSON object there. Write is a first-class Claude Code action — much more reliably triggered than coercing the model into emitting raw JSON on stdout.
+
+To make Write usable in non-interactive mode, the shim invokes `claude -p` with `--tools Write` and `--permission-mode bypassPermissions`. After the subprocess exits, the shim reads the tempfile, parses it as JSON, and synthesizes an Anthropic-shaped `tool_use` block from the contents. If the file is missing or invalid, the shim falls back to the original stdout-regex path; if that also fails, you get the usual graceful fallback (warning + bare structure for `parse_goal`, or a task retry for terminal tools in Generation / Reflection / Evolution).
+
+Implications:
+- The subprocess can write anywhere on disk during a forced call (limited to the Write tool, no Bash / Edit / Read). The model has only been observed to write to the exact tempfile path it's instructed to use, but the permission is broad.
+- Auto-tool calls (intermediate iterations where the model picks between search tools and `record_*`) still use the stdout-JSON path — those don't engage the Write fallback.
+
+#### What to expect operationally
+
+From empirical runs on `claude_code` with `--field-context` and `concurrency=1`:
+
+| Run shape | Hypotheses produced | parse_goal | Metareview overview |
+| --- | --- | --- | --- |
+| No survey, n=3 initial | 0–1 of 3 | falls back to bare plan | usually runs |
+| `--field-context` survey only | 2–3 of 3 | falls back to bare plan | usually runs |
+| `--field-context` + Write-tool safety net + `--wall-clock 1200` | **3 of 3** | **engages cleanly** | **runs cleanly** |
+
+The dominant failure mode without the Write-tool path is `"Generation did not call record_hypothesis"` — the model exhausts all 8 tool-loop iterations on literature search and never commits. `--field-context` is the single most effective mitigation (the curated survey removes the cold-start search incentive). The Write-tool safety net then catches the remaining forced-tool calls (notably `parse_goal`) that prompt-only stdout forcing misses.
+
+Give the run enough wall-clock for the metareview to fire after the main loop exits. `--wall-clock 900` was tight; `1200`+ is safer.
+
+#### Sample run — fully clean end-to-end
+
+A reference run with all three knobs (`claude_code`, `--field-context`, Write-tool path, `--wall-clock 1200`, `concurrency = 1`) on the goal:
+
+> *"Use sparse autoencoders to detect and reduce hallucinations in large language models"*
+
+with the STORM-generated SAE survey as `--field-context`. Outcomes:
+
+- 3 of 3 initial Generation tasks committed a `record_hypothesis`.
+- `parse_goal` produced a structured `record_research_plan` via the Write-tool tempfile path on the first try — no fallback warning.
+- Metareview `final` ran inside the wall-clock budget.
+- Reflection started (and timed out — first time the system reached that stage).
+- No subprocess crashes; clean exit.
+
+Artifacts committed to the repo for reference:
+
+- [`docs/sample_runs/hallucination_detection/overview.md`](docs/sample_runs/hallucination_detection/overview.md) — the metareview's research overview. Identifies two non-mutually-exclusive directions (targeted SAE feature suppression vs. epistemic-superposition cross-layer consistency), gives falsification criteria for each, and proposes running them in parallel as an adjudication design.
+- [`docs/sample_runs/hallucination_detection/hyp_fb0242ebb9fccae6.json`](docs/sample_runs/hallucination_detection/hyp_fb0242ebb9fccae6.json) — Hallucination-Subspace Suppression hypothesis.
+- [`docs/sample_runs/hallucination_detection/hyp_77724168529242d6.json`](docs/sample_runs/hallucination_detection/hyp_77724168529242d6.json) — Epistemic Superposition Monitoring hypothesis.
+- [`docs/sample_runs/hallucination_detection/hyp_6d18246faaab02b3.json`](docs/sample_runs/hallucination_detection/hyp_6d18246faaab02b3.json) — Epistemic-Mismatch SAE Feature Suppression hypothesis.
+
+Reproduce with:
+
+```bash
+co-scientist run "Use sparse autoencoders to detect and reduce hallucinations in large language models" \
+  --field-context path/to/sae_survey.md \
+  --n 3 --budget-usd 100 --wall-clock 1200
+```
+
+### Embeddings provider
+
+`[embeddings]` accepts `voyage` (default, requires `VOYAGE_API_KEY`), `openai` (requires `OPENAI_API_KEY`), `gemini` (requires `GEMINI_API_KEY` — free tier on AI Studio works), or `hash` (deterministic local fallback; works offline but only catches near-duplicate hypotheses, not semantic similarity). The auto-fallback chain inside `make_embedder()` is Voyage → OpenAI → hash for `provider = "voyage"`, and Gemini → OpenAI → hash for `provider = "gemini"`.
+
+```toml
+[embeddings]
+provider = "gemini"
+model = "gemini-embedding-001"   # 3072-dim native; truncate via dim below (Matryoshka)
+dim = 768
+```
+
+> Note: `text-embedding-004` is *only* exposed on Gemini's native API, not on the OpenAI-compatible endpoint co-scientist uses. Use `gemini-embedding-001` here. The client passes `dimensions = dim` for gemini-embedding-001 to get a Matryoshka-truncated vector.
 
 ## Configuration
 

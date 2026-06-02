@@ -47,6 +47,7 @@ class LLMProvider(Protocol):
 # Provider names accepted in config.
 KNOWN_PROVIDERS = frozenset({
     "anthropic",
+    "claude_code",    # local `claude -p` subprocess; uses user's Claude Code subscription
     "openai",
     "openai_compatible",
     "openrouter",
@@ -147,6 +148,11 @@ def get_provider(
         from .anthropic_client import AnthropicClient
 
         return AnthropicClient(cfg, db=db, budget=budget, retry_policy=retry_policy)
+
+    if name == "claude_code":
+        from .claude_code_client import ClaudeCodeClient
+
+        return ClaudeCodeClient(cfg, db=db, budget=budget, retry_policy=retry_policy)
 
     if name in ("openai", "openai_compatible"):
         from .openai_client import OpenAIClient

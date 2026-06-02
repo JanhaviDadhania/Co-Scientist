@@ -25,6 +25,10 @@ class RunCfg(BaseModel):
     wall_clock_seconds: int = 7200
     budget_tokens: int = 5_000_000
     budget_usd: float = 25.0
+    # Pre-curated field survey injected into Generation's user_blocks. Set via
+    # `co-scientist run --field-context <path>` — the CLI reads the file and
+    # stores its contents here. Empty string = no survey, default behavior.
+    field_context: str = ""
 
 
 class StorageCfg(BaseModel):
@@ -332,6 +336,7 @@ def has_anthropic_key(cfg: Config) -> bool:
 # Env var names per provider preset (see llm/provider.py KNOWN_PROVIDERS).
 _PROVIDER_ENV_VARS: dict[str, str] = {
     "anthropic":          "ANTHROPIC_API_KEY",
+    "claude_code":        "",   # keyless — uses user's Claude Code subscription
     "openai":             "OPENAI_API_KEY",
     "openai_compatible":  "OPENAI_API_KEY",
     "openrouter":         "OPENROUTER_API_KEY",

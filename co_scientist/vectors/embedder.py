@@ -110,6 +110,55 @@ class OpenAIEmbedder:
 
 
 # --------------------------------------------------------------------------- #
+# Gemini (free tier on AI Studio)
+
+
+class GeminiEmbedder:
+    """Google Gemini embeddings via the OpenAI-compatible endpoint.
+
+    Two models worth knowing about:
+    - `text-embedding-004` — 768-dim, free tier on AI Studio.
+    - `gemini-embedding-001` — up to 3072-dim, supports Matryoshka truncation
+      via the `dimensions` request param; paid.
+
+    Use the existing `[embeddings]` config: set `provider = "gemini"`,
+    `model = "text-embedding-004"`, `dim = 768`.
+    """
+
+    def __init__(self, cfg: Config) -> None:
+        self.model = cfg.embeddings.model
+        self.dim = cfg.embeddings.dim
+        self._cfg = cfg
+
+    async def embed(self, texts: list[str]) -> np.ndarray:
+        if not texts:
+            return np.zeros((0, self.dim), dtype="float32")
+        api_key = self._cfg.secrets.GEMINI_API_KEY or os.environ.get("GEMINI_API_KEY")
+        if not api_key:
+            raise RuntimeError("GEMINI_API_KEY not set; cannot use GeminiEmbedder")
+
+        try:
+            import openai  # type: ignore[import-not-found]
+        except ImportError as e:  # pragma: no cover
+            raise RuntimeError("pip install openai to use GeminiEmbedder") from e
+
+        client = openai.AsyncOpenAI(
+            api_key=api_key,
+            base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+        )
+        batches = [texts[i : i + 100] for i in range(0, len(texts), 100)]
+        out: list[list[float]] = []
+        for batch in batches:
+            kwargs: dict = {"model": self.model, "input": batch}
+            # gemini-embedding-001 honors `dimensions`; text-embedding-004 ignores it.
+            if "gemini-embedding" in self.model:
+                kwargs["dimensions"] = self.dim
+            resp = await client.embeddings.create(**kwargs)
+            out.extend(d.embedding for d in resp.data)
+        return _l2_normalize(np.asarray(out, dtype="float32"))
+
+
+# --------------------------------------------------------------------------- #
 # Resolver
 
 
@@ -189,6 +238,14 @@ def make_embedder(cfg: Config) -> Embedder:
         if cfg.secrets.OPENAI_API_KEY or os.environ.get("OPENAI_API_KEY"):
             return OpenAIEmbedder(cfg)
         _warn_once("openai_key_missing_using_hash_fallback")
+        return HashEmbedder(cfg)
+    if provider == "gemini":
+        if cfg.secrets.GEMINI_API_KEY or os.environ.get("GEMINI_API_KEY"):
+            return GeminiEmbedder(cfg)
+        if cfg.secrets.OPENAI_API_KEY or os.environ.get("OPENAI_API_KEY"):
+            _warn_once("gemini_key_missing_using_openai_embeddings")
+            return OpenAIEmbedder(cfg)
+        _warn_once("gemini_key_missing_using_hash_fallback")
         return HashEmbedder(cfg)
     if provider == "hash":
         return HashEmbedder(cfg)

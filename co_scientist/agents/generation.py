@@ -91,7 +91,29 @@ class GenerationAgent(BaseAgent):
                 cache=True,
             ),
         ]
-        user_blocks = [CachedBlock(prompt, cache=False)]
+        user_blocks: list[CachedBlock] = []
+        field_context = (self.deps.cfg.run.field_context or "").strip()
+        if field_context:
+            user_blocks.append(CachedBlock(
+                "# Field background — required reading\n\n"
+                "A curated survey of the field this hypothesis must address has "
+                "been provided below. READ IT IN FULL before doing anything else. "
+                "Your hypothesis MUST be informed by and consistent with this "
+                "material.\n\n"
+                "The literature search tools (pubmed_search, arxiv_search, "
+                "europe_pmc_search, web_search, web_fetch) are available but "
+                "should only be used to fill specific gaps the survey leaves "
+                "open — NOT to duplicate searches the survey has already done. "
+                "If the survey covers a topic, trust it and cite it; do not "
+                "re-search. If the survey is silent on a specific point your "
+                "hypothesis depends on, THEN you may search for that specific "
+                "point.\n\n"
+                "--- BEGIN SURVEY ---\n"
+                f"{field_context}\n"
+                "--- END SURVEY ---",
+                cache=True,
+            ))
+        user_blocks.append(CachedBlock(prompt, cache=False))
 
         r = route(self.deps.cfg, "generation", "literature")
         tools = [*self.deps.tools.anthropic_tools_for("generation"), RECORD_HYPOTHESIS_TOOL]
