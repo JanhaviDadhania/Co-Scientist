@@ -193,6 +193,12 @@ def run(
     concurrency: int | None = typer.Option(
         None, "--concurrency", help="Override worker concurrency."
     ),
+    field_context: Path | None = typer.Option(
+        None, "--field-context",
+        help="Path to a pre-curated field survey (e.g. STORM wiki page). "
+             "Injected into Generation as required-reading; literature search "
+             "tools are framed as fallback-only when this is set.",
+    ),
 ) -> None:
     """Start a fresh research session. Generation → Reflection → Ranking tournament → Meta-review."""
     cfg, _ = ctx.obj
@@ -205,6 +211,12 @@ def run(
         cfg.run.budget_usd = budget_usd
     if concurrency is not None:
         cfg.run.concurrency = concurrency
+    if field_context is not None:
+        cfg.run.field_context = field_context.read_text(encoding="utf-8")
+        console.print(
+            f"[dim]Loaded field-context survey: {len(cfg.run.field_context):,} chars "
+            f"(~{len(cfg.run.field_context)//4:,} tokens)[/dim]"
+        )
 
     # Pre-flight cost estimate
     from .llm.estimator import estimate as _estimate
