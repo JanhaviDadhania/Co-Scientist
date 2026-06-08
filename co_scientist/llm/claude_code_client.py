@@ -128,6 +128,8 @@ class ClaudeCodeClient:
             forced_tool_name=forced_tool_name,
             has_tools=bool(spec.tools),
             file_data=file_data,
+            forced_tool_schema=json_schema,
+            tools=spec.tools,
         )
         in_tok = message.usage.input_tokens
         out_tok = message.usage.output_tokens
@@ -220,23 +222,45 @@ class ClaudeCodeClient:
                 for tool in spec.tools:
                     if tool.get("name") == forced_tool_name:
                         schema = tool.get("input_schema") or {"type": "object"}
-                        json_schema = schema  # passed to --json-schema as a hint
-                        tempfile_path = Path(tempfile.gettempdir()) / (
-                            f"co_scientist_call_{uuid.uuid4().hex}.json"
-                        )
+                        json_schema = schema
+                        # Markdown-on-stdout path. No Write tool, no tempfile.
+                        # The model writes a structured markdown answer to stdout;
+                        # we parse it on the way out (see `_parse_markdown_payload`).
+                        tempfile_path = None
+                        template = self._build_markdown_template(forced_tool_name, schema)
                         system_parts.append(
-                            f"You have the Write tool available. Use it to write your "
-                            f"response JSON to this exact file path:\n\n"
-                            f"  {tempfile_path}\n\n"
-                            f"The file MUST contain ONLY a single valid JSON object that "
-                            f"conforms to the input schema of the tool '{forced_tool_name}':\n"
-                            f"{json.dumps(schema, default=str)}\n\n"
-                            f"Do NOT include markdown fences, code blocks, prose, or any "
-                            f"explanatory text inside the file. The file's content must "
-                            f"parse as raw JSON directly. After writing the file, you may "
-                            f"write a short acknowledgement in your reply, but the file is "
-                            f"what the system reads — your reply is ignored. Call Write "
-                            f"exactly once with the full JSON object as the file_text."
+                            f"=====================================================\n"
+                            f"HARD CONSTRAINT — STRUCTURED MARKDOWN ANSWER REQUIRED\n"
+                            f"=====================================================\n\n"
+                            f"The end of your stdout response is parsed by automated "
+                            f"downstream agents. They look for the markers shown below "
+                            f"and extract one section per property of the tool "
+                            f"'{forced_tool_name}'. Anything before BEGIN ANSWER is "
+                            f"ignored; anything after END ANSWER is ignored. There is no "
+                            f"human review and no retry.\n\n"
+                            f"You do not need to call any tool. You do not need to emit "
+                            f"JSON. You only need to end your response with the exact "
+                            f"template below, with the placeholder text replaced by your "
+                            f"real content.\n\n"
+                            f"REQUIRED FORMAT — copy this template, replace placeholders, "
+                            f"keep every '## <name>' header verbatim:\n\n"
+                            f"=== BEGIN ANSWER ===\n"
+                            f"{template}\n"
+                            f"=== END ANSWER ===\n\n"
+                            f"RULES:\n"
+                            f"  - every '## <property>' header must appear exactly once "
+                            f"(case and spelling matter for matching).\n"
+                            f"  - array properties use '- ' bullet lines, one item per line.\n"
+                            f"  - array-of-objects properties use '### <label>' sub-headers, "
+                            f"with one '- key: value' line per inner field.\n"
+                            f"  - keep the BEGIN/END ANSWER markers verbatim — they are "
+                            f"what bounds the parsed region.\n"
+                            f"  - put exactly ONE answer between the markers (you are "
+                            f"committing one record, not many).\n\n"
+                            f"(For reference, the tool's full JSON schema is below — "
+                            f"types and required-ness come from this. You do NOT need to "
+                            f"emit JSON; just fill the markdown template above.)\n\n"
+                            f"{json.dumps(schema, default=str)}"
                         )
                         break
             else:
@@ -246,12 +270,43 @@ class ClaudeCodeClient:
                     system_parts.append(
                         "You MUST call exactly one of the tools listed above."
                     )
+                # Two output formats — JSON tool_calls for cheap tools, markdown
+                # for "record_*" tools (commit-style, large structured payloads).
+                # The markdown path is much more reliable than coercing the model
+                # to emit a multi-paragraph JSON object on stdout.
+                record_tools = [
+                    t for t in spec.tools
+                    if (t.get("name") or "").startswith("record_")
+                ]
                 system_parts.append(
-                    'When you want to call a tool, respond with ONLY this JSON object '
+                    'When you want to call a SEARCH or LOOKUP tool, respond with ONLY this JSON object '
                     '(no markdown fences, no extra text):\n'
                     '{"tool_calls": [{"name": "<tool_name>", "arguments": {<args matching that tool\'s input_schema>}}]}\n'
-                    'If you do not want to call a tool, respond with plain text.'
+                    'If you do not want to call any tool, respond with plain text.'
                 )
+                for t in record_tools:
+                    rname = t["name"]
+                    rschema = t.get("input_schema") or {"type": "object"}
+                    tmpl = self._build_markdown_template(rname, rschema)
+                    system_parts.append(
+                        f"------------------------------------------------------\n"
+                        f"SPECIAL CASE — calling `{rname}` (structured-commit tool)\n"
+                        f"------------------------------------------------------\n\n"
+                        f"`{rname}` is a structured-commit tool with a large multi-field "
+                        f"payload. For this specific tool, DO NOT use the `{{tool_calls: [...]}}` "
+                        f"JSON format above — JSON-escaping a multi-paragraph payload is "
+                        f"error-prone. Instead, end your stdout response with the markdown "
+                        f"template below. Downstream code parses this markdown into the "
+                        f"tool's structured payload automatically.\n\n"
+                        f"To commit to `{rname}`, append this to the end of your response "
+                        f"(keep BEGIN/END markers verbatim, fill placeholders with your content):\n\n"
+                        f"=== BEGIN ANSWER ===\n"
+                        f"{tmpl}\n"
+                        f"=== END ANSWER ===\n\n"
+                        f"Use this markdown form for `{rname}` ONLY. Do not mix it with "
+                        f"`{{tool_calls: [...]}}` JSON. If you want to call a search tool "
+                        f"instead this turn, use the JSON form and skip the markdown."
+                    )
 
         system_text = "\n\n".join(p for p in system_parts if p).strip()
 
@@ -391,6 +446,8 @@ class ClaudeCodeClient:
         forced_tool_name: str | None,
         has_tools: bool,
         file_data: Any = None,
+        forced_tool_schema: dict | None = None,
+        tools: list[dict[str, Any]] | None = None,
     ) -> _Message:
         text = (raw.get("result") or "").strip()
         usage = raw.get("usage", {}) or {}
@@ -399,11 +456,13 @@ class ClaudeCodeClient:
         tool_used = False
 
         if forced_tool_name:
-            # Prefer the JSON the model wrote via the Write tool to a tempfile.
-            # That path is much more reliable than coercing it to emit raw JSON
-            # on stdout. We only fall back to stdout parsing if the file is
-            # missing or invalid.
-            args_obj = file_data if isinstance(file_data, (dict, list)) else None
+            # Primary: parse structured markdown the model wrote on stdout.
+            # That's the format the system prompt now asks for. Fallbacks below
+            # (file_data, JSON-in-text) cover legacy paths if any caller still
+            # passes a tempfile or the model happens to emit JSON anyway.
+            args_obj = self._parse_markdown_payload(text, forced_tool_schema)
+            if args_obj is None and isinstance(file_data, (dict, list)):
+                args_obj = file_data
             if args_obj is None:
                 args_obj = self._parse_json_object(text)
             if args_obj is not None:
@@ -433,7 +492,30 @@ class ClaudeCodeClient:
                     ))
                 tool_used = True
             else:
-                blocks.append(_Block(type="text", text=text))
+                # No tool_calls JSON found — try the markdown-commit path for any
+                # `record_*` tools in the catalog. This lets the model commit a
+                # large structured payload via markdown sections instead of JSON.
+                record_match = None
+                for t in (tools or []):
+                    name = t.get("name") or ""
+                    if not name.startswith("record_"):
+                        continue
+                    schema = t.get("input_schema") or {}
+                    parsed = self._parse_markdown_payload(text, schema)
+                    if parsed:
+                        record_match = (name, parsed)
+                        break
+                if record_match is not None:
+                    name, parsed = record_match
+                    blocks.append(_Block(
+                        type="tool_use",
+                        id=f"call_{uuid.uuid4().hex[:12]}",
+                        name=name,
+                        input=parsed,
+                    ))
+                    tool_used = True
+                else:
+                    blocks.append(_Block(type="text", text=text))
         else:
             blocks.append(_Block(type="text", text=text))
 
@@ -528,6 +610,151 @@ class ClaudeCodeClient:
                     except json.JSONDecodeError:
                         start = -1
         return None
+
+    # ------------------------------------------------------------------ #
+    # Markdown payload builder + parser (primary path for forced tools)  #
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _build_markdown_template(tool_name: str, schema: dict) -> str:
+        """Emit a markdown skeleton the model should mirror.
+
+        Each top-level property in `schema.properties` becomes a `## <name>`
+        section. Strings get a one-line placeholder; arrays-of-strings get two
+        bullet placeholders; arrays-of-objects get two `### <name> <n>` blocks
+        with `- key: value` lines.
+        """
+        props = (schema or {}).get("properties") or {}
+        required = set((schema or {}).get("required") or [])
+        out: list[str] = []
+        for name, spec in props.items():
+            marker = " (required)" if name in required else ""
+            t = (spec or {}).get("type", "string")
+            desc = (spec or {}).get("description", "")
+            out.append(f"## {name}{marker}")
+            if t == "array":
+                items_spec = (spec or {}).get("items") or {}
+                if items_spec.get("type") == "object":
+                    inner_props = list((items_spec.get("properties") or {}).keys())
+                    for n in (1, 2):
+                        out.append(f"### {name} {n}")
+                        for k in inner_props:
+                            out.append(f"- {k}: <value>")
+                else:
+                    out.append("- <item 1>")
+                    out.append("- <item 2>")
+            else:
+                hint = f"<{desc}>" if desc else f"<{t} value>"
+                out.append(hint)
+            out.append("")
+        return "\n".join(out).rstrip()
+
+    @staticmethod
+    def _normalize_section_key(s: str) -> str:
+        return re.sub(r"[^a-z0-9]+", "", s.lower())
+
+    @classmethod
+    def _parse_markdown_payload(cls, text: str, schema: dict | None) -> dict | None:
+        """Parse a structured-markdown response into a dict matching `schema`.
+
+        Tolerant to header capitalization, trailing colons, surrounding prose,
+        and missing sections. Returns None if no recognizable sections were
+        found; otherwise returns a best-effort dict with whatever was parsed.
+        """
+        if not text or not isinstance(schema, dict):
+            return None
+        props = schema.get("properties") or {}
+        if not props:
+            return None
+        # Constrain to the marker-bounded region if present.
+        if "BEGIN ANSWER" in text:
+            text = text.split("BEGIN ANSWER", 1)[1]
+        if "END ANSWER" in text:
+            text = text.split("END ANSWER", 1)[0]
+        name_for = {cls._normalize_section_key(k): k for k in props.keys()}
+        h2_pat = re.compile(r"(?m)^[ \t]*##[ \t]+(.+?)[ \t]*:?[ \t]*$\n")
+        matches = list(h2_pat.finditer(text))
+        if not matches:
+            return None
+        result: dict[str, Any] = {}
+        for i, m in enumerate(matches):
+            header = m.group(1).strip()
+            # Strip any "(required)" / "(optional)" annotation if the model echoed it.
+            header = re.sub(r"\s*\((?:required|optional)\)\s*$", "", header, flags=re.IGNORECASE)
+            canon = name_for.get(cls._normalize_section_key(header))
+            if canon is None:
+                continue
+            start = m.end()
+            end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+            body = text[start:end].strip()
+            # Strip placeholder-style content the model may have left in.
+            if body.startswith("<") and body.endswith(">") and "\n" not in body:
+                continue
+            result[canon] = cls._parse_section_body(body, props[canon])
+        return result or None
+
+    @classmethod
+    def _parse_section_body(cls, body: str, spec: dict) -> Any:
+        t = (spec or {}).get("type", "string")
+        if t == "string":
+            return body
+        if t == "integer":
+            mm = re.search(r"-?\d+", body)
+            return int(mm.group()) if mm else 0
+        if t == "number":
+            mm = re.search(r"-?\d+(?:\.\d+)?", body)
+            return float(mm.group()) if mm else 0.0
+        if t == "boolean":
+            return body.strip().lower() in ("true", "yes", "1")
+        if t == "array":
+            items_spec = (spec or {}).get("items") or {"type": "string"}
+            if items_spec.get("type") == "object":
+                return cls._parse_array_of_objects(body, items_spec)
+            return cls._parse_bullets(body)
+        return body
+
+    @staticmethod
+    def _parse_bullets(body: str) -> list[str]:
+        out: list[str] = []
+        for line in body.splitlines():
+            mm = re.match(r"\s*(?:[-*+•]|\d+[.)])\s+(.+)", line)
+            if mm:
+                v = mm.group(1).strip()
+                if v and not (v.startswith("<") and v.endswith(">")):
+                    out.append(v)
+        return out
+
+    @classmethod
+    def _parse_array_of_objects(cls, body: str, items_spec: dict) -> list[dict]:
+        objs: list[dict] = []
+        h3_pat = re.compile(r"(?m)^[ \t]*###[ \t]+(.+?)[ \t]*$\n")
+        matches = list(h3_pat.finditer(body))
+        if matches:
+            for i, m in enumerate(matches):
+                start = m.end()
+                end = matches[i + 1].start() if i + 1 < len(matches) else len(body)
+                obj = cls._parse_kv_pairs(body[start:end])
+                if obj:
+                    objs.append(obj)
+            return objs
+        obj = cls._parse_kv_pairs(body)
+        return [obj] if obj else []
+
+    @staticmethod
+    def _parse_kv_pairs(body: str) -> dict:
+        """Parse '- key: value' or 'key: value' lines into a dict (lowercased keys)."""
+        out: dict[str, Any] = {}
+        for line in body.splitlines():
+            mm = re.match(r"\s*(?:[-*+]\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*:\s*(.+)", line)
+            if mm:
+                key = mm.group(1).strip().lower()
+                val = mm.group(2).strip()
+                if len(val) >= 2 and val[0] == val[-1] and val[0] in ('"', "'"):
+                    val = val[1:-1]
+                if val.startswith("<") and val.endswith(">"):
+                    continue
+                out[key] = val
+        return out
 
     @staticmethod
     def _extract_tool_calls(text: str) -> list[dict[str, Any]]:
