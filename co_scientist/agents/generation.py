@@ -67,19 +67,56 @@ class GenerationAgent(BaseAgent):
             "empty searches is far better than running out of turns with nothing."
         )
 
+        instructions_block = (
+            "=========================================================\n"
+            "HARD CONSTRAINT — DOWNSTREAM PIPELINE READS YOUR OUTPUT\n"
+            "=========================================================\n\n"
+            "You are the hypothesis-generation step in an automated multi-agent "
+            "research pipeline. Downstream agents (Reflection, Ranking, Evolution, "
+            "Meta-review) consume the structured `record_hypothesis` payload you "
+            "emit. They do not read your prose, your thinking, or your "
+            "intermediate tool-call results — they ONLY read the fields of your "
+            "`record_hypothesis` call. The schema and the field set are a "
+            "CONTRACT, not a suggestion.\n\n"
+            "If you fail to call `record_hypothesis`, or call it with a malformed "
+            "payload, or call it with missing required fields, the pipeline halts "
+            "and ALL the work you just did — every search, every analysis — is "
+            "discarded. There is no human in the loop, no retry, no salvage path.\n\n"
+            "WORKFLOW:\n"
+            "1. Search the literature as much as you need — no fixed search "
+            "budget. Use pubmed_search, arxiv_search, europe_pmc_search, "
+            "web_search, web_fetch freely until you feel grounded in the goal.\n"
+            "2. Once grounded, call `record_hypothesis` EXACTLY ONCE with the "
+            "complete payload specified below. Do not call it twice. Do not "
+            "summarize in prose instead of calling it. Do not ask clarifying "
+            "questions. Do not describe what you would do — DO IT.\n\n"
+            "EXACT FORMAT — every field below is required by downstream agents:\n"
+            "  • title — short noun-phrase title (string, non-empty)\n"
+            "  • statement — ONE sentence stating the hypothesis (string, non-empty)\n"
+            "  • mechanism — detailed causal/mechanistic story (string, "
+            "multi-paragraph OK, but a single coherent string — not an array)\n"
+            "  • entities — array of specific named actors (proteins, materials, "
+            "datasets, models, etc.) as strings; never an array of objects\n"
+            "  • anticipated_outcomes — concrete observations that would confirm "
+            "the hypothesis if true (string)\n"
+            "  • novelty_argument — what is new relative to the cited literature "
+            "(string)\n"
+            "  • citations — array of objects, each with at minimum {url, title, "
+            "excerpt}. Every url MUST be a url you actually opened during this "
+            "task's tool calls. If you did not open any urls, return [] — DO NOT "
+            "fabricate urls.\n\n"
+            "Propose EXACTLY ONE hypothesis — the strongest you can justify. "
+            "Additional hypotheses come from separate Generation calls.\n\n"
+            "FINAL REMINDER: your ONLY valid exit from this task is a single "
+            "`record_hypothesis` call whose payload matches the exact field set "
+            "above. Anything else breaks the pipeline."
+        )
         prompt = render(
             "generation.literature",
             goal=plan.objective,
             preferences="; ".join(plan.preferences),
             articles_with_reasoning=articles_block,
-            instructions=(
-                "Propose ONE hypothesis (the strongest you can justify) and "
-                "register it via the record_hypothesis tool. Do not propose more "
-                "than one — additional hypotheses come from separate Generation calls. "
-                "You MUST end this task by calling record_hypothesis; do not keep "
-                "searching indefinitely. Budget your literature search to a handful "
-                "of queries, then commit."
-            ),
+            instructions=instructions_block,
         )
         _ = n_target  # n_target controls how many parallel Generation tasks are enqueued, not per-call output
 
