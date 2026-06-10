@@ -66,16 +66,20 @@ class MetaReviewAgent(BaseAgent):
             debate_rationales=debate_block,
         )
         r = route(self.deps.cfg, "metareview", "system")
+        sys_blocks = [
+            CachedBlock(self._system_prompt_header(), cache=True),
+            CachedBlock(
+                f"# Research goal\n{session.research_goal}\n\n"
+                f"# Preferences\n{'; '.join(session.research_plan.preferences)}",
+                cache=True,
+            ),
+        ]
+        survey = self._field_context_block()
+        if survey is not None:
+            sys_blocks.append(survey)
         spec = AgentCallSpec(
             route=r,
-            system_blocks=[
-                CachedBlock(self._system_prompt_header(), cache=True),
-                CachedBlock(
-                    f"# Research goal\n{session.research_goal}\n\n"
-                    f"# Preferences\n{'; '.join(session.research_plan.preferences)}",
-                    cache=True,
-                ),
-            ],
+            system_blocks=sys_blocks,
             user_blocks=[CachedBlock(prompt, cache=False)],
             tools=[RECORD_SYSTEM_FEEDBACK_TOOL],
             tool_choice={"type": "tool", "name": "record_system_feedback"},
@@ -120,57 +124,70 @@ class MetaReviewAgent(BaseAgent):
         if session is None:
             raise RuntimeError(f"session {task.session_id} missing")
 
-        top = await hyp_repo.top_by_elo(self.deps.db, session.id, k=10)
+        # ALL hypotheses — no top-K cap. The deliverable the scientist reads
+        # must not be synthesized from a truncated view of the run.
         all_hyps = await hyp_repo.list_for_session(self.deps.db, session.id)
-        if not top and not all_hyps:
+        if not all_hyps:
             return TaskResult(kind="noop", extra={"reason": "no hypotheses"})
-        if not top:
-            top = all_hyps[:10]
+        hyps = sorted(all_hyps, key=lambda h: -(h.elo if h.elo is not None else -1))
 
         # Fetch all reviews for the session in one query, then group by
-        # hypothesis_id. Beats N+1 list_for_hypothesis() calls for top-K.
+        # hypothesis_id. Beats N+1 list_for_hypothesis() calls.
         reviews_by_hyp: dict[str, list] = {}
         for rv in await rev_repo.list_for_session(self.deps.db, session.id):
             reviews_by_hyp.setdefault(rv.hypothesis_id, []).append(rv)
 
-        # Build the top-hypotheses block: summary + best review + winning rationale
+        # Per hypothesis: FULL text (not the truncated summary), the best
+        # review's full body, and the winning debate rationale — everything
+        # the metareview.final prompt promises it was given.
         chunks: list[str] = []
-        for h in top:
-            review_lines: list[str] = []
-            for r in reviews_by_hyp.get(h.id, []):
-                review_lines.append(
-                    f"  - {r.kind}: verdict={r.verdict or '?'} "
-                    f"(n={r.scores.novelty}, c={r.scores.correctness}, t={r.scores.testability})"
+        for h in hyps:
+            rs = reviews_by_hyp.get(h.id, [])
+            best_review = None
+            if rs:
+                rs_sorted = sorted(
+                    rs, key=lambda r: (r.kind != "full", -(r.scores.novelty or 0))
                 )
-            elo_s = f"{h.elo:.0f}" if h.elo is not None else "—"
-            chunks.append(
-                f"### `{h.id}` (Elo {elo_s}, strategy `{h.strategy}`)\n"
-                f"**Title.** {h.title}\n\n"
-                f"{h.summary}\n\n"
-                f"**Reviews:**\n" + ("\n".join(review_lines) or "  (none)")
+                best_review = rs_sorted[0].body
+            rationale = await tourney_repo.winning_rationale_for(
+                self.deps.db, session.id, h.id
             )
+            elo_s = f"{h.elo:.0f}" if h.elo is not None else "—"
+            chunk = (
+                f"### `{h.id}` (Elo {elo_s}, strategy `{h.strategy}`, "
+                f"state `{h.state}`, matches {h.matches_played})\n\n"
+                f"{h.full_text}\n\n"
+                f"**Best review:**\n{best_review or '(none)'}"
+            )
+            if rationale:
+                chunk += f"\n\n**Winning debate rationale:**\n{rationale}"
+            chunks.append(chunk)
         top_block = "\n\n---\n\n".join(chunks)
 
-        latest_fb = await fb_repo.latest_system_feedback(self.deps.db, session.id)
+        composed_fb = await fb_repo.composed_feedback(self.deps.db, session.id)
 
         prompt = render(
             "metareview.final",
             goal=session.research_plan.objective,
             preferences="; ".join(session.research_plan.preferences),
-            system_feedback=latest_fb.text if latest_fb else "",
+            system_feedback=composed_fb or "",
             top_hypotheses_block=top_block,
         )
         r = route(self.deps.cfg, "metareview", "final")
+        sys_blocks = [
+            CachedBlock(self._system_prompt_header(), cache=True),
+            CachedBlock(
+                f"# Research goal\n{session.research_goal}\n\n"
+                f"# Preferences\n{'; '.join(session.research_plan.preferences)}",
+                cache=True,
+            ),
+        ]
+        survey = self._field_context_block()
+        if survey is not None:
+            sys_blocks.append(survey)
         spec = AgentCallSpec(
             route=r,
-            system_blocks=[
-                CachedBlock(self._system_prompt_header(), cache=True),
-                CachedBlock(
-                    f"# Research goal\n{session.research_goal}\n\n"
-                    f"# Preferences\n{'; '.join(session.research_plan.preferences)}",
-                    cache=True,
-                ),
-            ],
+            system_blocks=sys_blocks,
             user_blocks=[CachedBlock(prompt, cache=False)],
             tools=[],            # No tools — write the markdown directly
             tool_choice=None,
@@ -190,5 +207,5 @@ class MetaReviewAgent(BaseAgent):
         )
         return TaskResult(
             kind="final_overview_generated",
-            extra={"overview_path": overview_path, "n_top": len(top)},
+            extra={"overview_path": overview_path, "n_hypotheses": len(hyps)},
         )

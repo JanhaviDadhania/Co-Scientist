@@ -181,8 +181,10 @@ def run(
     preferences_file: Path | None = typer.Option(
         None, "--preferences-file", help="Path to a text file with extra preferences."
     ),
-    n_initial: int = typer.Option(
-        3, "--n", help="Number of initial Generation calls (parallel)."
+    n_initial: int | None = typer.Option(
+        None, "--n",
+        help="Override the number of hypotheses for this run. Default: "
+             "derived from the discussion by ParseGoal (15 when unstated).",
     ),
     wall_clock: int | None = typer.Option(
         None, "--wall-clock", help="Override wall-clock cap in seconds."
@@ -196,8 +198,13 @@ def run(
     field_context: Path | None = typer.Option(
         None, "--field-context",
         help="Path to a pre-curated field survey (e.g. STORM wiki page). "
-             "Injected into Generation as required-reading; literature search "
-             "tools are framed as fallback-only when this is set.",
+             "Injected into every agent as required-reading; literature "
+             "search tools are framed as gap-filling when this is set.",
+    ),
+    discussion: Path | None = typer.Option(
+        None, "--discussion",
+        help="Path to the originating discussion (e.g. coffeechat log). "
+             "ParseGoal reads it to derive the plan and the number of ideas.",
     ),
 ) -> None:
     """Start a fresh research session. Generation → Reflection → Ranking tournament → Meta-review."""
@@ -216,6 +223,12 @@ def run(
         console.print(
             f"[dim]Loaded field-context survey: {len(cfg.run.field_context):,} chars "
             f"(~{len(cfg.run.field_context)//4:,} tokens)[/dim]"
+        )
+    if discussion is not None:
+        cfg.run.discussion = discussion.read_text(encoding="utf-8")
+        console.print(
+            f"[dim]Loaded discussion: {len(cfg.run.discussion):,} chars "
+            f"(~{len(cfg.run.discussion)//4:,} tokens)[/dim]"
         )
 
     # Pre-flight cost estimate

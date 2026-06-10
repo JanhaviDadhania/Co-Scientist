@@ -58,6 +58,14 @@ RECORD_HYPOTHESIS_TOOL: dict[str, Any] = {
                 "type": "array", "items": {"type": "string"},
                 "description": "Hypothesis IDs this one descends from (Evolution only).",
             },
+            "creative_work": {
+                "type": "string",
+                "description": (
+                    "The creative warm-up (poem / very short story) written "
+                    "before hypothesizing. Stored as a creative artifact and "
+                    "fed to the out-of-the-box evolution step."
+                ),
+            },
         },
         "required": [
             "title", "statement", "mechanism",
@@ -155,6 +163,14 @@ RECORD_RESEARCH_PLAN_TOOL: dict[str, Any] = {
             "idea_attributes": {"type": "array", "items": {"type": "string"}},
             "domain_hint":     {"type": "string"},
             "notes":           {"type": "string"},
+            "n_ideas": {
+                "type": "integer",
+                "description": (
+                    "How many hypotheses this run should generate. If the "
+                    "discussion or goal states a desired number of ideas, use "
+                    "it; otherwise use 15."
+                ),
+            },
         },
         "required": ["objective", "preferences", "idea_attributes"],
     },

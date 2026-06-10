@@ -64,6 +64,13 @@ class ReflectionAgent(BaseAgent):
                 cache=True,
             ),
         ]
+        survey = self._field_context_block(tools_note=(
+            "Check the hypothesis's claims against this survey FIRST; use the "
+            "search tools only to fill specific gaps the survey leaves open — "
+            "do not re-search what the survey already covers."
+        ))
+        if survey is not None:
+            sys_blocks.append(survey)
         user_blocks = [CachedBlock(prompt, cache=False)]
 
         r = route(self.deps.cfg, "reflection", "full")

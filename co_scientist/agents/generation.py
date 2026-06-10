@@ -20,7 +20,7 @@ from ..llm.tool_loop import ToolLoopExhausted, run_tool_loop
 from ..logging import get_logger
 from ..models import CitedPaper, Hypothesis, ResearchPlan, Task, TaskResult
 from ..safety.quoting import quote_untrusted
-from ..storage.artifacts import write_json
+from ..storage.artifacts import write_json, write_text
 from ..storage.repos import embeddings as emb_repo
 from ..storage.repos import feedback as fb_repo
 from ..storage.repos import hypotheses as hyp_repo
@@ -56,20 +56,23 @@ class GenerationAgent(BaseAgent):
             "abstracts for the most relevant items, then synthesize. After you "
             "have surveyed the literature, call `record_hypothesis` exactly once "
             "with your proposed hypothesis.\n\n"
-            "IMPORTANT — interpreting empty search results: an empty result set "
-            "(no hits) is positive evidence that the literature you searched for "
-            "does not exist. When the goal requires a candidate with NO prior "
-            "published evidence, empty searches CONFIRM novelty — they are a "
-            "reason to PROCEED, not to keep searching. Do not chase confirmation "
-            "you will never get. After at most 2-3 searches that return no "
-            "relevant hits for a candidate, treat its novelty as established and "
-            "call `record_hypothesis`. A recorded hypothesis backed by a few "
-            "empty searches is far better than running out of turns with nothing."
+            "NOVELTY DISCIPLINE — how to claim novelty honestly:\n"
+            "  • Before claiming a candidate is novel, run at least 2 DISTINCT "
+            "query phrasings for it — different vocabulary and angle, not "
+            "rewordings of one string.\n"
+            "  • OPEN AND READ the closest hits (web_fetch) before concluding; "
+            "a title that looks unrelated can hide the same mechanism.\n"
+            "  • An empty result set is WEAK evidence: it may mean novelty, or "
+            "it may mean bad phrasing. Never treat empty searches alone as "
+            "proof of novelty.\n"
+            "  • Record the exact queries you ran inside `novelty_argument` "
+            "(e.g. 'searched: \"…\", \"…\" — closest prior work is X, which "
+            "differs because Y') so the reviewer can audit your search."
         )
 
         instructions_block = (
             "=========================================================\n"
-            "HARD CONSTRAINT — DOWNSTREAM PIPELINE READS YOUR OUTPUT\n"
+            "STRUCTURED COMMIT — DOWNSTREAM PIPELINE READS YOUR OUTPUT\n"
             "=========================================================\n\n"
             "You are the hypothesis-generation step in an automated multi-agent "
             "research pipeline. Downstream agents (Reflection, Ranking, Evolution, "
@@ -77,16 +80,23 @@ class GenerationAgent(BaseAgent):
             "emit. They do not read your prose, your thinking, or your "
             "intermediate tool-call results — they ONLY read the fields of your "
             "`record_hypothesis` call. The schema and the field set are a "
-            "CONTRACT, not a suggestion.\n\n"
-            "If you fail to call `record_hypothesis`, or call it with a malformed "
-            "payload, or call it with missing required fields, the pipeline halts "
-            "and ALL the work you just did — every search, every analysis — is "
-            "discarded. There is no human in the loop, no retry, no salvage path.\n\n"
+            "CONTRACT.\n\n"
+            "Your payload is validated against the schema. If it is missing or "
+            "invalid you will be re-invoked with the exact validation errors; "
+            "repeated failures fail the task. Commit correctly the first time.\n\n"
             "WORKFLOW:\n"
-            "1. Search the literature as much as you need — no fixed search "
+            "1. CREATIVE WARM-UP — before any searching, write a short poem or "
+            "very short story (roughly 8–20 lines) that plays with the research "
+            "goal's themes: its tensions, its imagery, what the world looks like "
+            "if the answer is strange. This is not decoration — it activates the "
+            "associative thinking the hypothesis needs, and it is SAVED as a "
+            "creative artifact and later fed to the out-of-the-box evolution "
+            "step as divergence fuel. You will include it verbatim in the "
+            "`creative_work` field.\n"
+            "2. Search the literature as much as you need — no fixed search "
             "budget. Use pubmed_search, arxiv_search, europe_pmc_search, "
             "web_search, web_fetch freely until you feel grounded in the goal.\n"
-            "2. Once grounded, call `record_hypothesis` EXACTLY ONCE with the "
+            "3. Once grounded, call `record_hypothesis` EXACTLY ONCE with the "
             "complete payload specified below. Do not call it twice. Do not "
             "summarize in prose instead of calling it. Do not ask clarifying "
             "questions. Do not describe what you would do — DO IT.\n\n"
@@ -99,17 +109,19 @@ class GenerationAgent(BaseAgent):
             "datasets, models, etc.) as strings; never an array of objects\n"
             "  • anticipated_outcomes — concrete observations that would confirm "
             "the hypothesis if true (string)\n"
-            "  • novelty_argument — what is new relative to the cited literature "
-            "(string)\n"
+            "  • novelty_argument — what is new relative to the cited literature, "
+            "INCLUDING the exact search queries you ran (string)\n"
             "  • citations — array of objects, each with at minimum {url, title, "
             "excerpt}. Every url MUST be a url you actually opened during this "
             "task's tool calls. If you did not open any urls, return [] — DO NOT "
-            "fabricate urls.\n\n"
+            "fabricate urls.\n"
+            "  • creative_work — your step-1 warm-up poem/story, verbatim "
+            "(string, REQUIRED for generation)\n\n"
             "Propose EXACTLY ONE hypothesis — the strongest you can justify. "
             "Additional hypotheses come from separate Generation calls.\n\n"
             "FINAL REMINDER: your ONLY valid exit from this task is a single "
             "`record_hypothesis` call whose payload matches the exact field set "
-            "above. Anything else breaks the pipeline."
+            "above."
         )
         prompt = render(
             "generation.literature",
@@ -215,12 +227,6 @@ class GenerationAgent(BaseAgent):
         summary = (record.get("statement") or "") + "\n\n" + (record.get("mechanism") or "")
         full_text = _render_hypothesis_md(record)
 
-        # Write the JSON artifact first so the row points at a real file.
-        artifact_path = await write_json(
-            self.deps.cfg, session_id, "hypotheses", hid,
-            {"strategy": strategy, "record": record},
-        )
-
         citations = [
             CitedPaper(
                 title=c.get("title", ""),
@@ -233,16 +239,41 @@ class GenerationAgent(BaseAgent):
             if isinstance(c, dict) and c.get("url")
         ]
 
-        # Step 1: embed + near-neighbour check (does NOT mutate FAISS).
+        # Step 1: embed + near-neighbour check (does NOT mutate FAISS) —
+        # BEFORE any artifact write, so a rejected record lands in discarded/
+        # instead of polluting hypotheses/.
         try:
-            dup_id, embed_payload = await self._dedup_query(session_id, summary)
+            dup_id, similarity, embed_payload = await self._dedup_query(session_id, summary)
         except Exception as e:
             log.warning("dedup_query_failed", err=str(e))
-            dup_id, embed_payload = None, None
+            dup_id, similarity, embed_payload = None, None, None
 
-        if dup_id is not None and dup_id != hid:
-            # Found a near-duplicate already in this session: skip insert + skip FAISS.
+        # A child is never deduped against its own parent — Evolution's
+        # simplify offspring RESEMBLE their parent by design; they compete in
+        # the tournament instead.
+        parents = set(record.get("parent_ids") or [])
+        if dup_id is not None and dup_id != hid and dup_id not in parents:
+            # Near-duplicate: skip insert + FAISS, but never silently — the
+            # full record is saved to discarded/ and an event is emitted.
+            await self._record_discard(
+                session_id, hid, record,
+                strategy=strategy, duplicate_of=dup_id, similarity=similarity,
+            )
             return dup_id, False
+
+        # Write the JSON artifact so the row points at a real file.
+        artifact_path = await write_json(
+            self.deps.cfg, session_id, "hypotheses", hid,
+            {"strategy": strategy, "record": record},
+        )
+        # Save the creative warm-up — every one, without fail.
+        creative = (record.get("creative_work") or "").strip()
+        if creative:
+            await write_text(
+                self.deps.cfg, session_id, "creative", hid, ".md", creative
+            )
+        else:
+            log.warning("creative_work_missing", hypothesis_id=hid)
 
         # Step 2: insert the hypothesis row. Deterministic IDs make this idempotent.
         h = Hypothesis(
@@ -273,32 +304,32 @@ class GenerationAgent(BaseAgent):
 
     async def _dedup_query(
         self, session_id: str, text: str
-    ) -> tuple[str | None, dict[str, Any] | None]:
+    ) -> tuple[str | None, float | None, dict[str, Any] | None]:
         """Read-only: embed + nearest-neighbour search. No FAISS mutation.
 
-        Returns (existing_duplicate_id_or_None, embed_payload_for_later_commit).
+        Returns (duplicate_id_or_None, similarity_or_None, embed_payload).
         """
         try:
             embedder = make_embedder(self.deps.cfg)
         except (RuntimeError, ValueError):
-            return None, None
+            return None, None, None
         vec = await embedder.embed([text])
         if vec.size == 0:
-            return None, None
+            return None, None, None
         v = vec[0]
         store = FaissStore(self.deps.cfg, session_id, dim=embedder.dim)
         await store.load_or_create()
         nearest = await store.search(np.asarray(v), k=1)
         thr = self.deps.cfg.vectors.dedup_cosine_threshold
-        if nearest and nearest[0][1] >= thr:
-            return nearest[0][0], None
         payload = {
             "vector": np.asarray(v),
             "model": embedder.model,
             "dim": embedder.dim,
             "text_hash": ids.text_hash(text),
         }
-        return None, payload
+        if nearest and nearest[0][1] >= thr:
+            return nearest[0][0], float(nearest[0][1]), payload
+        return None, None, payload
 
     async def _dedup_commit(
         self, session_id: str, hypothesis_id: str, payload: dict[str, Any]
@@ -370,5 +401,5 @@ def _build_session_context(goal: str, plan: ResearchPlan, sys_feedback_text: str
 
 
 async def _latest_system_feedback(deps: AgentDeps, session_id: str) -> str | None:
-    fb = await fb_repo.latest_system_feedback(deps.db, session_id)
-    return fb.text if fb is not None else None
+    """Composed pull: all active human directives + latest meta-review steering."""
+    return await fb_repo.composed_feedback(deps.db, session_id)

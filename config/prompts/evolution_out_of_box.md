@@ -19,4 +19,16 @@ Inspiration may be drawn from the following concepts (utilize analogy and inspir
 
 {% endfor -%}
 
+{% if creative_works %}
+Creative impressions written alongside earlier hypotheses in this session. They are DIVERGENCE FUEL:
+mine them for analogy, metaphor, mood, and associations that the structured hypothesis texts above do
+not contain. Do not copy their content -- let them pull you toward semantic neighborhoods the current
+pool has not visited.
+{% for c in creative_works -%}
+<CREATIVE_WORK id="{{ c.id }}">
+{{ c.text }}
+</CREATIVE_WORK_END id="{{ c.id }}">
+
+{% endfor -%}
+{% endif %}
 Response, then call `record_hypothesis` (set `parent_ids` to the IDs of the inspiring hypotheses):

@@ -25,10 +25,14 @@ class RunCfg(BaseModel):
     wall_clock_seconds: int = 7200
     budget_tokens: int = 5_000_000
     budget_usd: float = 25.0
-    # Pre-curated field survey injected into Generation's user_blocks. Set via
+    # Pre-curated field survey injected into every agent's context. Set via
     # `co-scientist run --field-context <path>` — the CLI reads the file and
     # stores its contents here. Empty string = no survey, default behavior.
     field_context: str = ""
+    # The originating discussion (e.g. the coffeechat log). Set via
+    # `co-scientist run --discussion <path>`; ParseGoal reads it to derive
+    # the research plan and how many ideas the run should produce.
+    discussion: str = ""
 
 
 class StorageCfg(BaseModel):

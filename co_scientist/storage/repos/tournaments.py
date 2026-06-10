@@ -99,6 +99,21 @@ async def count_matches(conn: aiosqlite.Connection, session_id: str) -> int:
     return row["n"] if row else 0
 
 
+async def winning_rationale_for(
+    conn: aiosqlite.Connection, session_id: str, hypothesis_id: str
+) -> str | None:
+    """The most recent debate rationale from a match this hypothesis WON."""
+    async with conn.execute(
+        """SELECT rationale FROM tournament_matches
+              WHERE session_id=? AND rationale IS NOT NULL
+                AND ((winner='a' AND hyp_a=?) OR (winner='b' AND hyp_b=?))
+              ORDER BY created_at DESC LIMIT 1""",
+        (session_id, hypothesis_id, hypothesis_id),
+    ) as cur:
+        row = await cur.fetchone()
+    return row["rationale"] if row else None
+
+
 async def recent_rationales(
     conn: aiosqlite.Connection, session_id: str, limit: int = 50
 ) -> list[str]:

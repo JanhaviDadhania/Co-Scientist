@@ -61,6 +61,39 @@ from .schemas import RECORD_RESEARCH_PLAN_TOOL
 
 log = get_logger("supervisor")
 
+# Default ideas per run when the discussion doesn't say otherwise.
+DEFAULT_N_IDEAS = 15
+
+
+def next_batch_size(remaining: int) -> int:
+    """Generation batch sizing: half the remaining target, floor of 3.
+
+    For N=15 this yields 8 → 4 → 3 — a first batch big enough to build a
+    real leaderboard, then smaller batches generated AFTER meta-review
+    feedback exists, so they are steered by it.
+    """
+    if remaining <= 0:
+        return 0
+    if remaining <= 4:
+        return remaining
+    return -(-remaining // 2)  # ceil(remaining / 2)
+
+
+def evolution_gate(population: int) -> int:
+    """Mature-hypothesis threshold for Evolution, proportional and capped.
+
+    pop 8 → 4 · pop 15 → 8 · pop 30+ → 10, never more.
+    """
+    return max(4, min(10, -(-population // 2)))
+
+
+def metareview_due(match_count: int, feedback_count: int, population: int) -> bool:
+    """Proportional meta-review trigger: every ~population × 4 matches."""
+    if population < 2:
+        return False
+    interval = max(8, population * 4)
+    return match_count >= (feedback_count + 1) * interval
+
 
 # ----------------------------- public API ----------------------------- #
 
@@ -76,7 +109,7 @@ class Supervisor:
         goal: str,
         *,
         preferences_text: str | None = None,
-        n_initial: int = 3,
+        n_initial: int | None = None,
         wall_clock_seconds: int | None = None,
         resume_session_id: str | None = None,
     ) -> str:
@@ -103,12 +136,24 @@ class Supervisor:
                 tools = ToolRegistry(self.cfg).discover()
                 deps = AgentDeps(cfg=self.cfg, db=conn, llm=llm, tools=tools)
 
-                plan = await self._parse_goal(deps, session, goal, preferences_text)
+                try:
+                    plan = await self._parse_goal(deps, session, goal, preferences_text)
+                except Exception:
+                    await sess_repo.set_status(conn, session.id, "failed")
+                    raise
+                # An explicit --n overrides whatever ParseGoal derived.
+                if n_initial is not None and n_initial >= 1:
+                    plan.n_ideas = min(n_initial, self.cfg.run.max_ideas)
                 await self._apply_plan(conn, session, plan)
                 session = await sess_repo.fetch(conn, session.id)
                 assert session is not None
 
-                for i in range(n_initial):
+                # Enqueue only the FIRST batch — the rest arrive via the
+                # batched refill in _decide_next_steps, after meta-review
+                # feedback exists to steer them.
+                first_batch = next_batch_size(plan.n_ideas)
+                log.info("generation_batched", n_ideas=plan.n_ideas, first_batch=first_batch)
+                for i in range(first_batch):
                     await task_repo.enqueue(conn, Task(
                         id=ids.task_id(), session_id=session.id,
                         created_at=datetime.now(UTC),
@@ -123,6 +168,19 @@ class Supervisor:
                     raise RuntimeError(f"no such session: {resume_session_id}")
                 bind(session_id=session.id)
                 log.info("session_resumed", session_id=session.id, status=session.status)
+                # Restore run inputs that live only in the session's config
+                # snapshot (the resume CLI path has no --field-context /
+                # --discussion flags) so the survey and discussion are never
+                # silently dropped on resume.
+                snap_run = (session.config_snapshot or {}).get("run") or {}
+                if not self.cfg.run.field_context and snap_run.get("field_context"):
+                    self.cfg.run.field_context = snap_run["field_context"]
+                    log.info("field_context_restored",
+                             chars=len(self.cfg.run.field_context))
+                if not self.cfg.run.discussion and snap_run.get("discussion"):
+                    self.cfg.run.discussion = snap_run["discussion"]
+                    log.info("discussion_restored",
+                             chars=len(self.cfg.run.discussion))
                 reclaimed = await task_repo.reclaim_expired_leases(
                     conn, session.id, max_attempts=self.cfg.lease.max_attempts,
                 )
@@ -190,6 +248,7 @@ class Supervisor:
         prompt = render(
             "parse_goal", goal=goal,
             preferences_text=preferences_text or "",
+            discussion=(self.cfg.run.discussion or "").strip(),
         )
         r = route(self.cfg, "parse_goal", None)
         spec = AgentCallSpec(
@@ -213,8 +272,18 @@ class Supervisor:
                     record = inp
                     break
         if record is None:
-            log.warning("parse_goal_no_record", note="falling back to bare ResearchPlan")
-            return ResearchPlan(objective=goal.strip(), preferences=[], idea_attributes=[])
+            # No silent fallback: a degraded bare plan would scope every later
+            # prompt with empty preferences/constraints for the whole session.
+            # The provider already validated + retried; if we still have no
+            # record, halt loudly.
+            raise RuntimeError(
+                "parse_goal did not produce a record_research_plan payload "
+                "after validation retries — halting (no bare-plan fallback)"
+            )
+        n_ideas = record.get("n_ideas")
+        if not isinstance(n_ideas, int) or n_ideas < 1:
+            n_ideas = DEFAULT_N_IDEAS
+        n_ideas = min(n_ideas, self.cfg.run.max_ideas)
         return ResearchPlan(
             objective=record.get("objective", goal.strip()),
             preferences=record.get("preferences", []),
@@ -222,6 +291,7 @@ class Supervisor:
             idea_attributes=record.get("idea_attributes", []),
             domain_hint=record.get("domain_hint") or None,
             notes=record.get("notes") or None,
+            n_ideas=n_ideas,
         )
 
     async def _apply_plan(
@@ -430,6 +500,32 @@ class Supervisor:
         # double-counting work toward the budget.
         anchor_mc = await tourney_repo.count_matches(conn, session.id)
 
+        # Batched Generation refill: while fewer generation-born hypotheses
+        # exist than the plan's target, enqueue the next batch. This is what
+        # makes the meta-review → generation learning loop real — refill
+        # batches START after feedback exists, so they pull it in.
+        n_target = getattr(session.research_plan, "n_ideas", DEFAULT_N_IDEAS)
+        async with conn.execute(
+            """SELECT COUNT(*) AS n FROM hypotheses
+                  WHERE session_id=? AND created_by='generation'""",
+            (session.id,),
+        ) as cur:
+            row = await cur.fetchone()
+        gen_count = row["n"] if row else 0
+        batch = next_batch_size(n_target - gen_count)
+        if batch > 0:
+            for i in range(batch):
+                await task_repo.enqueue(conn, Task(
+                    id=ids.task_id(), session_id=session.id,
+                    created_at=datetime.now(UTC),
+                    agent="generation", action="CreateInitialHypotheses",
+                    payload={"strategy": "literature", "n": 1},
+                    priority=100, status="pending",
+                    idempotency_key=f"{session.id}::generation::refill::{gen_count}::{i}",
+                ))
+            enqueued += batch
+            log.info("generation_refill", have=gen_count, target=n_target, batch=batch)
+
         # Always: one tournament batch to keep refining Elo.
         in_tournament = await hyp_repo.list_for_session(
             conn, session.id, state="in_tournament"
@@ -445,9 +541,12 @@ class Supervisor:
             ))
             enqueued += 1
 
-        # If the leaderboard has matured (>= 20 hypotheses with ≥ 3 matches), evolve.
+        # Evolve when the leaderboard has matured. The gate is proportional
+        # to the population and capped at 10 — the old flat ≥20 was
+        # unreachable at realistic population sizes.
+        population = len(in_tournament)
         mature = sum(1 for h in in_tournament if h.matches_played >= 3)
-        if mature >= 20:
+        if mature >= evolution_gate(population):
             await task_repo.enqueue(conn, Task(
                 id=ids.task_id(), session_id=session.id,
                 created_at=datetime.now(UTC),
@@ -459,7 +558,7 @@ class Supervisor:
             ))
             enqueued += 1
 
-        # Periodic meta-review (every ~5 minutes wall, approximated by match count).
+        # Periodic meta-review — proportional trigger (~population × 4 matches).
         mc = await tourney_repo.count_matches(conn, session.id)
         async with conn.execute(
             """SELECT COUNT(*) AS n FROM system_feedback
@@ -468,7 +567,7 @@ class Supervisor:
         ) as cur:
             row = await cur.fetchone()
         feedback_count = row["n"] if row else 0
-        if mc >= (feedback_count + 1) * 50:
+        if metareview_due(mc, feedback_count, population):
             await task_repo.enqueue(conn, Task(
                 id=ids.task_id(), session_id=session.id,
                 created_at=datetime.now(UTC),
@@ -493,6 +592,13 @@ class Supervisor:
         n_cancel = await task_repo.cancel_pending_for_session(conn, session.id)
         if n_cancel:
             log.info("pending_cancelled", n=n_cancel)
+
+        # Machine-readable Elo standings — the handoff reads this to pick the
+        # tournament winner instead of globbing files in mtime order.
+        try:
+            await self._write_standings(conn, session)
+        except Exception as e:
+            log.exception("standings_write_failed", err=str(e))
 
         # Try to run the proper final overview via metareview if the agent exists.
         # Fall back to the stub if metareview is not yet wired in (older builds).
@@ -536,6 +642,37 @@ class Supervisor:
 
         await self._emit(conn, session.id, "session_done",
                          {"stop_reason": stop_reason.value if stop_reason else None})
+
+    async def _write_standings(
+        self, conn: aiosqlite.Connection, session: Session
+    ) -> str:
+        """Write final/standings.json — the full Elo table, ranked."""
+        from ..storage.artifacts import write_json
+        from ..storage.repos import tournaments as tourney_repo
+
+        hyps = await hyp_repo.list_for_session(conn, session.id)
+        hyps = sorted(hyps, key=lambda h: -(h.elo if h.elo is not None else -1))
+        standings = {
+            "session_id": session.id,
+            "match_count": await tourney_repo.count_matches(conn, session.id),
+            "standings": [
+                {
+                    "rank": i,
+                    "id": h.id,
+                    "elo": h.elo,
+                    "matches_played": h.matches_played,
+                    "state": h.state,
+                    "strategy": h.strategy,
+                    "created_by": h.created_by,
+                    "title": h.title,
+                    "artifact_path": h.artifact_path,
+                }
+                for i, h in enumerate(hyps, 1)
+            ],
+        }
+        path = await write_json(self.cfg, session.id, "final", "standings", standings)
+        log.info("standings_written", path=path, n=len(hyps))
+        return path
 
     async def _write_simple_overview(
         self, conn: aiosqlite.Connection, session: Session
