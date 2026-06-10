@@ -1,0 +1,494 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Co-Scientist — Sequence of LM Prompts in One Run</title>
+<style>
+  :root {
+    --fg: #1a1a1a;
+    --muted: #5c5c5c;
+    --accent: #0b6e4f;
+    --bg: #fafaf7;
+    --code-bg: #f0efe9;
+    --border: #d6d4cc;
+  }
+  body {
+    font: 16px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    color: var(--fg);
+    background: var(--bg);
+    max-width: 860px;
+    margin: 2.5rem auto;
+    padding: 0 1.25rem 4rem;
+  }
+  h1 { font-size: 1.6rem; margin: 0 0 0.25rem; }
+  h2 { font-size: 1.15rem; margin: 2.2rem 0 0.7rem; color: var(--accent); }
+  p { margin: 0.6rem 0; }
+  .lede { color: var(--muted); margin-bottom: 1.5rem; }
+  pre {
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 1rem 1.1rem;
+    overflow-x: auto;
+    font: 13.5px/1.5 "SF Mono", Menlo, Monaco, Consolas, monospace;
+  }
+  code {
+    background: var(--code-bg);
+    padding: 0.08em 0.35em;
+    border-radius: 4px;
+    font: 13.5px/1.4 "SF Mono", Menlo, Monaco, Consolas, monospace;
+  }
+  table {
+    border-collapse: collapse;
+    margin: 0.8rem 0;
+    font-size: 14.5px;
+  }
+  th, td {
+    border-bottom: 1px solid var(--border);
+    padding: 0.45rem 0.9rem 0.45rem 0;
+    text-align: left;
+    vertical-align: top;
+  }
+  th { color: var(--muted); font-weight: 600; }
+  td.num { text-align: right; }
+  .total td { border-top: 1px solid var(--border); font-weight: 600; }
+  .note {
+    background: #fff;
+    border-left: 3px solid var(--accent);
+    padding: 0.7rem 1rem;
+    margin: 1rem 0;
+    border-radius: 0 4px 4px 0;
+  }
+  .note strong { color: var(--accent); }
+  hr { border: none; border-top: 1px solid var(--border); margin: 2rem 0; }
+</style>
+</head>
+<body>
+
+<h1>Co-Scientist — Sequence of LM Prompts in One Run</h1>
+<p class="lede">The order LM calls fire when co-scientist processes one research goal.
+Design page, updated 2026-06-10 — the review against the 2026-06-02 code walkthrough is settled and every agreed
+fix is folded into the step descriptions below as decided behavior. Implementation follows; code unchanged as of
+this update. Modeled after the companion STORM doc.</p>
+
+<h2>The architecture — a queue and shared tables, NOT a pipeline</h2>
+
+<p>Nothing in this system is sequential and no agent ever calls another agent or hands it data. There are exactly
+two shared structures, and everything goes through them:</p>
+
+<pre>
+                      ┌─────────────────────────────┐
+                      │  SUPERVISOR — the only      │
+                      │  scheduler in the system    │
+                      └─────────────────────────────┘
+                         │ pulls tasks            ▲
+                         │ (concurrency = 2)      │ finished tasks
+                         ▼                        │ enqueue follow-ups
+        ╔════════════════════════════════════════════════════════════╗
+        ║  1. TASK QUEUE  (SQLite table: tasks)                      ║
+        ║                                                            ║
+        ║  [Gen][Gen][Gen][Refl][Rank][Rank][Evo][MetaRev] pending…  ║
+        ╚════════════════════════════════════════════════════════════╝
+                         │ a pulled task runs as one of:
+                         ▼
+        ┌──────────┬──────────┬─────────┬───────────┬────────────┐
+        │Generation│Reflection│ Ranking │ Evolution │ Meta-review│
+        └──────────┴──────────┴─────────┴───────────┴────────────┘
+             │ WRITES results                  ▲ READS what it needs
+             │ when it finishes…               │ at the moment it STARTS
+             ▼                                 │
+        ╔════════════════════════════════════════════════════════════╗
+        ║  2. SHARED STATE  (one SQLite file + artifacts dir)        ║
+        ║                                                            ║
+        ║   hypotheses           ← written by Generation, Evolution  ║
+        ║   reviews              ← written by Reflection             ║
+        ║   tournament_matches   ← written by Ranking (+elo_journal) ║
+        ║   system_feedback      ← written by Meta-review AND HUMAN  ║
+        ║   transcripts          ← written by EVERY single LM call   ║
+        ║                                                            ║
+        ║   payloads also land as JSON: data/artifacts/&lt;session&gt;/…   ║
+        ╚════════════════════════════════════════════════════════════╝
+
+   PULL, NOT PUSH: nothing is ever "sent" to an agent. A task reads the
+   freshest shared state at the moment it starts — which is exactly why
+   Generation runs in BATCHES: later batches start after meta-review
+   feedback exists, so they pull it in. That is the learning loop.
+</pre>
+
+<p>Who writes and who reads each table:</p>
+
+<table>
+  <thead>
+    <tr><th>Table</th><th>Written by</th><th>Read by (at task start)</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>hypotheses</code></td><td>Generation, Evolution</td><td>Reflection (the hypothesis to review), Ranking (both sides of a match), Evolution (<code>top_by_elo</code> parents), final overview, handoff converter (via standings)</td></tr>
+    <tr><td><code>reviews</code></td><td>Reflection</td><td>Ranking (best review per side), Evolution (parent's review — except out_of_box), final overview</td></tr>
+    <tr><td><code>tournament_matches</code> + <code>elo_journal</code></td><td>Ranking</td><td>Supervisor gates (evolution maturity, meta-review trigger), Evolution (top-K selection), <code>final/standings.json</code> at finalize</td></tr>
+    <tr><td><code>system_feedback</code></td><td>Meta-review (<code>source='meta_review'</code>) and the human (<code>source='human'</code> — mid-run steering, see below)</td><td>Generation and Evolution — ALL active human rows + the latest meta-review row, composed into the prompt's context block; the <code>active</code> flag is honored</td></tr>
+    <tr><td><code>tasks</code></td><td>Supervisor + every finished task (follow-up enqueues)</td><td>Supervisor only</td></tr>
+    <tr><td><code>transcripts</code></td><td>Every LM call (full <code>messages[]</code> as JSON on disk)</td><td>Nothing in-run — audit and usage accounting</td></tr>
+  </tbody>
+</table>
+
+<h2>The sequence</h2>
+
+<div class="note">
+  <strong>How to read this.</strong> Each box below is a TASK TYPE pulled from the queue, not a pipeline stage.
+  "→ follow-up: enqueue X" means the finished task drops a new task into the queue — it is not a function call,
+  and nothing waits for it. Tasks belonging to different hypotheses interleave freely: a Ranking match runs while
+  another hypothesis's Generation tool loop is still mid-flight. The numbered order shows the typical causal
+  chain for <em>one</em> hypothesis.
+</div>
+
+<pre>
+┌─ STAGE 0: Parse the goal (1 LM call) ─────────────────────────────────┐
+
+  [non-LM]: leaflet_run.sh passes THREE inputs — the short topic
+            title, the STORM survey (--field-context), and the full
+            coffeechat discussion (--discussion). Survey + discussion
+            are persisted on the session row, so resume keeps them.
+
+  1. ParseGoal(goal, discussion)
+     → prompt: "parse_goal.md"
+     → forced tool: record_research_plan — via the FILE HANDSHAKE:
+         the prompt instructs Claude Code to Write the payload as
+         JSON to a per-call tempfile (Write is its most-practiced,
+         native tool); the wrapper reads the file back and VALIDATES
+         it against the tool's input_schema; any failure re-invokes
+         with the exact validation errors (≤ 2 retries); exhausted
+         retries HALT the run loudly. No silent fallback, no bare
+         plan. The same handshake carries every record_* tool.
+     → produces a ResearchPlan: objective, preferences, constraints,
+       idea_attributes, domain_hint — AND N, the number of ideas,
+       derived from the discussion (default 15 when it is silent)
+     → supervisor enqueues the FIRST BATCH of Generation tasks
+       (8 of 15), not all of them — see the batched refill below
+
+└──────────────────────────────────────────────────────────────────────┘
+
+┌─ STAGE 1: Main loop ──────────────────────────────────────────────────┐
+│  task scheduler runs concurrency-many tasks at once;                  │
+│  every finished task may enqueue follow-ups;                          │
+│  loop terminates on budget / wall-clock / Elo stability / idle        │
+
+  ┌─ Generation (per batch task) ──────────────────────────────────┐
+  │                                                                │
+  │   2. Generation(goal, plan, feedback)                          │
+  │      → prompt: "generation_literature.md"                      │
+  │      → context blocks (all cached):                            │
+  │          • the STORM survey — "required reading"; search       │
+  │            tools fill gaps only, never re-search the survey    │
+  │          • the ResearchPlan from ParseGoal                     │
+  │          • composed feedback: ALL active human rows + latest   │
+  │            meta-review row from system_feedback                │
+  │      → CREATIVE WARM-UP first: a poem/story about the topic,   │
+  │        written in the SAME context as the hypothesis, saved    │
+  │        to creative/ — every single one, without fail           │
+  │      → tool loop, up to 8 iterations:                          │
+  │           pubmed_search | arxiv_search | europe_pmc_search |   │
+  │           web_search | web_fetch |                             │
+  │           record_hypothesis (file handshake, terminal)         │
+  │      → novelty discipline: ≥2 distinct query phrasings; OPEN   │
+  │        AND READ the closest hits before claiming novelty; the  │
+  │        queries run are logged inside novelty_argument so       │
+  │        Reflection can audit them                               │
+  │      → dedup: ≥ 0.92 cosine to an existing idea → rejected     │
+  │        WITH an event + discarded/ marker ("rejected: 0.94      │
+  │        similar to hyp_X") — nothing vanishes silently; a       │
+  │        child is NEVER deduped against its own parent           │
+  │      → follow-up: enqueue Reflection                           │
+  └────────────────────────────────────────────────────────────────┘
+
+  ──── BATCHED REFILL ─────────────────────────────────────────────
+       when the queue idles and population &lt; N, _decide_next_steps
+       enqueues the next Generation batch: 8 → 4 → 3 (N=15).
+       Later batches START after meta-review feedback exists, so
+       they pull it — steered exploration, not blind repetition.
+
+  ┌─ Reflection (1 per new hypothesis) ────────────────────────────┐
+  │                                                                │
+  │   3. Reflection(hypothesis)                                    │
+  │      → prompt: "reflection_review.md"  (= reflection.full)     │
+  │      → context: the STORM survey (same cached block), so the   │
+  │        reviewer checks claims against the curated background   │
+  │        instead of re-searching the web blind                   │
+  │      → tool loop, up to 8 iterations:                          │
+  │           same lit-search tools +                              │
+  │           record_review (file handshake, terminal)             │
+  │      → result: novelty / correctness / testability scores +    │
+  │        full review body → reviews table                        │
+  │      → follow-up: enqueue Ranking.AddToTournament              │
+  └────────────────────────────────────────────────────────────────┘
+
+  ┌─ Ranking — Elo tournament ─────────────────────────────────────┐
+  │                                                                │
+  │   AddToTournament (non-LM): Elo=1200, schedule pairings        │
+  │                                                                │
+  │   4a. RankingDebate(A, B)   ← cold / Δelo&lt;50  (low confidence) │
+  │       → prompt: "ranking.debate.md"                            │
+  │   4b. RankingPairwise(A, B) ← warm / Δelo≥50 (high confidence) │
+  │       → prompt: "ranking.pairwise.md"                          │
+  │       (1 direct LM call each — no tool loop)                   │
+  │                                                                │
+  │   → context: the STORM survey + both sides' best reviews       │
+  │   → presentation order RANDOMIZED per match — no fixed         │
+  │     anchor, so position bias washes out over rematches         │
+  │                                                                │
+  │   verdict ("better idea: 1|2") → Elo update → match record;    │
+  │   the full verdict + rationale saved to matches/ as a          │
+  │   readable file, not just a SQLite row                         │
+  │   every ~20 matches → Proximity reclusters (no LM)             │
+  └────────────────────────────────────────────────────────────────┘
+
+  ┌─ Evolution (fires when the leaderboard matures) ───────────────┐
+  │                                                                │
+  │   WHAT IT DOES: breeds improved offspring from the best ideas  │
+  │   so far, instead of only re-ranking first drafts forever.     │
+  │   Offspring re-enter via Reflection and must EARN their place  │
+  │   in the tournament like any other hypothesis. Hypotheses are  │
+  │   immutable — old ideas improve through descendants that       │
+  │   out-rank them, never by being edited in place.               │
+  │                                                                │
+  │   gate: mature ≥ max(4, min(10, ceil(0.5 × population)))       │
+  │         (pop 8 → 4 · pop 15 → 8 · pop 30+ → 10, never more)    │
+  │                                                                │
+  │   5a. EvolutionCombine(top-1 + most-distant, both reviews)     │
+  │       → prompt: "evolution_combine.md"                         │
+  │       → merge the strengths of two UNLIKE ideas into a hybrid  │
+  │   5b. EvolutionSimplify(top-1 + its review)                    │
+  │       → prompt: "evolution_simplify.md"                        │
+  │       → strip the best idea to a cleaner, more testable core   │
+  │       → the child is exempt from dedup against its own parent  │
+  │   5c. EvolutionOutOfBox(top-5 + ALL creative works)            │
+  │       → prompt: "evolution_out_of_box.md"                      │
+  │       → deliberate divergence; the poems/stories are the       │
+  │         divergence fuel — loose associations and metaphors     │
+  │         from different semantic neighborhoods than the         │
+  │         structured hypothesis text                             │
+  │                                                                │
+  │   all three also get: the STORM survey + composed feedback     │
+  │   each strategy = 1 tool_loop call (≤6 iters); offspring       │
+  │   re-enter the cycle via the Reflection follow-up rule.        │
+  └────────────────────────────────────────────────────────────────┘
+
+  ┌─ Meta-review (system feedback, fires periodically) ────────────┐
+  │                                                                │
+  │   WHAT IT DOES: the system's only way of learning from its     │
+  │   own mistakes mid-run. Reads ALL reviews + match history,     │
+  │   spots recurring weaknesses ("ideas keep failing on           │
+  │   testability", "everything clusters around one mechanism"),   │
+  │   and writes steering feedback that every LATER Generation /   │
+  │   Evolution task pulls at start.                               │
+  │                                                                │
+  │   6. MetaReviewSystem                                          │
+  │      → prompt: "metareview_system.md"                          │
+  │      → forced tool: record_system_feedback (file handshake)    │
+  │      → trigger: every ~population × 4 matches, when idle       │
+  │      → each steering text also saved to feedback/              │
+  └────────────────────────────────────────────────────────────────┘
+
+  ──── HUMAN IN THE LOOP ──────────────────────────────────────────
+       insert a row into system_feedback at any time:
+         source='human'
+         kind = directive | preference | rejection | pin
+         target_id = hypothesis id (rejection/pin) or NULL
+       Agents pull ALL ACTIVE human rows + the latest meta-review
+       row, composed — human feedback persists across meta-review
+       cycles, it is never shadowed by a newer meta-review row.
+       'rejection' drops the target from the tournament; 'pin'
+       protects it. The active flag is honored on every pull.
+
+└──────────────────────────────────────────────────────────────────────┘
+
+┌─ STAGE 2: Finalize (1 LM call) ───────────────────────────────────────┐
+
+  7. MetaReviewFinal(ALL hypotheses, reviews, rationales, feedback)
+     → prompt: "metareview_final.md"
+     → no tools; the model writes prose directly
+     → receives EVERY hypothesis — no top-K cap — each with its
+       FULL text (no truncated summaries), its full best review
+       body, and its winning debate rationale
+     → SAVED as final/overview.md
+
+  [non-LM]: finalize also writes final/standings.json — the full
+            Elo table: id, elo, matches_played, state — so the
+            tournament's verdict is machine-readable downstream.
+
+└──────────────────────────────────────────────────────────────────────┘
+
+┌─ HANDOFF to AI-Scientist (non-LM, leaflet side) ──────────────────────┐
+
+  [non-LM]: cosci_to_aisci_idea.py reads final/standings.json and
+            converts the ELO WINNER into the AI-Scientist idea
+            schema; run_three_hypotheses.sh iterates in RANK ORDER.
+            discarded/ ideas are never picked up.
+
+└──────────────────────────────────────────────────────────────────────┘</pre>
+
+<h2>Reflection vs. Meta-review — one idea vs. the whole run</h2>
+
+<table>
+  <thead>
+    <tr><th></th><th>Reflection</th><th>Meta-review (system)</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><strong>Looks at</strong></td><td>ONE hypothesis</td><td>the whole session: all reviews + all match history</td></tr>
+    <tr><td><strong>Asks</strong></td><td>"is <em>this idea</em> novel, correct, testable?"</td><td>"what patterns keep repeating <em>across all ideas</em>?"</td></tr>
+    <tr><td><strong>Output</strong></td><td>a scored review → <code>reviews</code> table</td><td>one steering text → <code>system_feedback</code> table</td></tr>
+    <tr><td><strong>Who uses it</strong></td><td>follows that hypothesis around: Ranking matches, Evolution when breeding from it, the final overview</td><td>future Generation / Evolution tasks pull it at start to write better <em>next</em> ideas</td></tr>
+    <tr><td><strong>Fires</strong></td><td>once per new hypothesis</td><td>every ~population × 4 matches</td></tr>
+  </tbody>
+</table>
+
+<div class="note">
+  <strong>Analogy.</strong> Reflection is the referee report on one paper. Meta-review is the program chair's memo
+  — "most submissions this year failed on testability, everyone clustered around mechanism X" — that tells future
+  authors what to do differently. It is a review <em>of the reviews</em>, hence "meta."
+</div>
+
+<div class="note">
+  <strong>Human feedback rides the same rail.</strong> The human inserts rows into <code>system_feedback</code>
+  with <code>source='human'</code> and a <code>kind</code>: <code>directive</code> ("focus on CPU-feasible
+  mechanisms"), <code>preference</code>, <code>rejection</code> (+ <code>target_id</code> — drops that hypothesis
+  from the tournament), or <code>pin</code> (+ <code>target_id</code> — protects it). Every Generation and
+  Evolution task pulls <em>all active human rows</em> plus the <em>latest</em> meta-review row, composed — so a
+  human directive persists for the rest of the run (until deactivated via <code>active=0</code>), while
+  meta-review steering refreshes each cycle. Combined with batched refill, this means: read the standings mid-run,
+  drop a directive, and the next batch obeys it.
+</div>
+
+<h2>Knobs</h2>
+<table>
+  <thead>
+    <tr><th>Knob</th><th>Value</th><th>Note</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>N (ideas per run)</td><td>from the discussion; default 15</td><td>derived by ParseGoal</td></tr>
+    <tr><td>batch schedule</td><td>8 → 4 → 3</td><td>first batch builds the leaderboard; later batches generate steered</td></tr>
+    <tr><td>evolution gate</td><td><code>mature ≥ max(4, min(10, ceil(0.5 × population)))</code></td><td>mature = in-tournament with ≥3 matches</td></tr>
+    <tr><td>meta-review trigger</td><td>every ~population × 4 matches</td><td>proportional, fires when idle</td></tr>
+    <tr><td>dedup threshold</td><td>cosine ≥ 0.92</td><td>rejection always leaves a <code>discarded/</code> marker + event; never applied child-vs-own-parent</td></tr>
+    <tr><td>forced-tool handshake</td><td>Write JSON to tempfile → validate → ≤2 retries</td><td>exhausted retries halt loudly; no silent fallback anywhere</td></tr>
+    <tr><td>ranking anchor</td><td>randomized per match</td><td>position bias washes out over rematches</td></tr>
+    <tr><td>wall clock</td><td>~2400 s (40 min)</td><td><code>co-scientist.toml</code>; was 900 s</td></tr>
+    <tr><td><code>concurrency</code></td><td>2</td><td>subprocess-bound (~3-5 s cold-start per LM call)</td></tr>
+    <tr><td><code>max_ideas</code></td><td>60</td><td>runaway-safety ceiling only — never discards content</td></tr>
+    <tr><td><code>max_matches_per_idea</code></td><td>12</td><td>stops re-judging settled pairs — never discards content</td></tr>
+  </tbody>
+</table>
+
+<h2>Concrete call count for one run (N=15)</h2>
+<p>Wall clock is the binding constraint, not budget: every LM call is a <code>claude -p</code> subprocess with
+~3-5&nbsp;s cold-start, running 2 at a time.</p>
+<table>
+  <thead>
+    <tr><th>Prompt</th><th class="num">Times fired</th><th>Why</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>parse_goal</code></td><td class="num">1 (+≤2 retries)</td><td>once at session start, validated via file handshake</td></tr>
+    <tr><td><code>generation_literature</code></td><td class="num">15</td><td>batches of 8 → 4 → 3; each is a tool loop of 1&nbsp;–&nbsp;8 LM calls</td></tr>
+    <tr><td><code>reflection_review</code></td><td class="num">15&nbsp;–&nbsp;21</td><td>one per hypothesis, including evolution offspring; each is a tool loop</td></tr>
+    <tr><td><code>ranking.debate</code> + <code>ranking.pairwise</code></td><td class="num">40&nbsp;–&nbsp;90</td><td>hard ceiling 15×12/2 = 90 matches; in practice wall-clock-bound</td></tr>
+    <tr><td><code>evolution_combine</code> / <code>_simplify</code> / <code>_out_of_box</code></td><td class="num">1&nbsp;–&nbsp;2 each</td><td>gate reachable from population ≥ 8; each strategy is a tool loop of ≤6 calls</td></tr>
+    <tr><td><code>metareview_system</code></td><td class="num">2&nbsp;–&nbsp;4</td><td>proportional trigger (~population × 4 matches)</td></tr>
+    <tr><td><code>metareview_final</code></td><td class="num">1</td><td>always, once at termination</td></tr>
+    <tr class="total"><td>Total LM calls (incl. tool-loop iterations)</td><td class="num">~120&nbsp;–&nbsp;250</td><td>tool loops short-circuit on the first <code>record_*</code> commit or run to cap</td></tr>
+  </tbody>
+</table>
+
+<h2>Notes about the order</h2>
+
+<div class="note">
+  <strong>Ranking has no tool loop.</strong> Unlike Generation, Reflection, and Evolution, each Ranking match is a
+  single direct LM call — no literature search, no nested iterations. That's why the tournament racks up many
+  matches quickly while Generation and Reflection are slower per-hypothesis. The verdict is parsed from the
+  trailing text via a regex looking for <code>better idea: 1|2</code>; the full rationale is saved to
+  <code>matches/</code>.
+</div>
+
+<div class="note">
+  <strong>Reflection.full, Ranking.debate vs. Ranking.pairwise are alternatives</strong> — only one fires per
+  invocation. Reflection ships three modes (<code>full</code>, <code>verification</code>, <code>observation</code>)
+  but only <code>full</code> is wired up in this fork. Ranking's <code>_select_mode()</code> picks debate when
+  either match counter is &lt; 2 or the Elo gap is &lt; 50, otherwise pairwise. Evolution's three strategies, by
+  contrast, are <em>not</em> mutually exclusive — every EvolveTopHypotheses task runs combine + simplify +
+  out_of_box in sequence.
+</div>
+
+<div class="note">
+  <strong>The tool loop is the load-bearing inner mechanism.</strong> Each Generation / Reflection / Evolution
+  task is one outer task but up to 8 (Generation, Reflection) or 6 (Evolution) inner LM calls — one per assistant
+  turn in the assistant ↔ tool_use ↔ tool_result loop. The loop ends when the model commits via a terminal
+  <code>record_*</code> tool — which travels over the file handshake (Write JSON to tempfile → validate → retry
+  with errors) — or hits the max-iters cap. On the final allowed iteration the supervisor forces the terminal
+  tool so the run commits instead of looping on yet another search.
+</div>
+
+<div class="note">
+  <strong>Meta-review fires twice in two different shapes.</strong> <code>metareview_system</code> is steering
+  feedback that future Generation and Evolution tasks pull — it shapes the next batches. <code>metareview_final</code>
+  is the readable end-of-run document built from everything. Only the final overview is what you sit down and read.
+</div>
+
+<div class="note">
+  <strong>Proximity is non-LM.</strong> Embeddings (Voyage → OpenAI → hash fallback) plus sklearn clustering. It
+  schedules a recluster every ~20 matches to drive informative pair selection — but it never calls the LM. Its
+  presence in the agent roster is what makes co-scientist "7 agents" and not "6 LM agents".
+</div>
+
+<h2>Persistence guarantees — save everything, cap nothing</h2>
+
+<div class="note">
+  <strong>Everything the LLM generates is kept.</strong>
+  <ul style="margin:0.2rem 0 0.2rem 1.1rem; padding:0;">
+    <li>Every LM call's full <code>messages[]</code> → transcript JSON on disk (already true today).</li>
+    <li>Every creative warm-up → <code>creative/</code>, without fail.</li>
+    <li>Every dedup rejection → <code>discarded/</code> marker + event naming the duplicate-of idea and similarity.</li>
+    <li>Every match verdict + rationale → <code>matches/</code> as readable files.</li>
+    <li>Every meta-review steering text → <code>feedback/</code>.</li>
+    <li>Final Elo table → <code>final/standings.json</code>; overview → <code>final/overview.md</code>.</li>
+    <li><code>leaflet_run.sh</code> copies the entire session artifacts dir into <code>runs/&lt;slug&gt;/hypothesis/raw/</code>.</li>
+  </ul>
+</div>
+
+<div class="note">
+  <strong>No content caps.</strong> The final overview receives ALL hypotheses with full text — no top-K, no
+  truncated summaries (everything that feeds prompts uses <code>full_text</code>; the 300/1000-char DB-row
+  truncations are display conveniences only). <code>max_ideas=60</code> and <code>max_matches_per_idea=12</code>
+  are safety/efficiency ceilings — they stop runaway loops and re-judging settled pairs; they never discard
+  generated content.
+</div>
+
+<h2>Later — ideas not in this round</h2>
+
+<div class="note">
+  <ul style="margin:0.2rem 0 0.2rem 1.1rem; padding:0;">
+    <li><strong>Wire the dead reflection modes</strong> (<code>verification</code>, <code>observation</code>) for
+        cheap review diversity.</li>
+    <li><strong>Seed Elo from reflection scores</strong> instead of a flat 1200, or fit Bradley-Terry over all
+        match records at finalize.</li>
+    <li><strong>Enable the disabled <code>feasibility</code> evolution strategy</strong> with M3/CPU framing — it
+        would pre-shape offspring for what AI-Scientist can actually run.</li>
+    <li><strong>Raise ranking concurrency</strong> — single direct calls are the cheapest thing to parallelize
+        beyond <code>concurrency=2</code>.</li>
+    <li><strong>Use proximity clusters in the final overview</strong> — present hypothesis families rather than a
+        flat list.</li>
+    <li><strong>Delete or finish <code>generation_debate.md</code></strong> — currently dead code behind a
+        <code>NotImplementedError</code>.</li>
+  </ul>
+</div>
+
+<hr>
+<p class="lede">Source: <code>co-scientist/co_scientist/agents/</code> — see <code>supervisor.py</code>,
+<code>generation.py</code>, <code>reflection.py</code>, <code>ranking.py</code>, <code>evolution.py</code>,
+<code>proximity.py</code>, <code>metareview.py</code>. Tool-loop machinery in
+<code>co_scientist/llm/tool_loop.py</code>; the forced-tool file handshake in
+<code>co_scientist/llm/claude_code_client.py</code>. Prompt templates in <code>config/prompts/</code> (14 Jinja2
+markdown files). Limits in <code>config/default.toml</code> + <code>co-scientist.toml</code>; handoff in
+<code>cosci_to_aisci_idea.py</code> and <code>leaflet_run.sh</code>.
+Mirror copy: <code>bismuth-memory/projects/the_mirror</code> → concavemirror.to
+<code>/research/autoresearcher/co_scientist_prompt_sequence.html</code> (sync after implementation).</p>
+
+</body>
+</html>
