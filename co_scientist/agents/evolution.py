@@ -25,7 +25,7 @@ from ..llm.tool_loop import ToolLoopExhausted, run_tool_loop
 from ..logging import get_logger
 from ..models import CitedPaper, Hypothesis, Task, TaskResult
 from ..safety.quoting import quote_hypothesis
-from ..storage.artifacts import write_json
+from ..storage.artifacts import write_json, write_text
 from ..storage.repos import embeddings as emb_repo
 from ..storage.repos import feedback as fb_repo
 from ..storage.repos import hypotheses as hyp_repo
@@ -116,12 +116,31 @@ class EvolutionAgent(BaseAgent):
                 {"id": h.id, "text": quote_hypothesis(h.full_text, id_=h.id)}
                 for h in inspirations
             ],
+            creative_works=self._load_creative_works(session.id),
         )
         return await self._run_and_persist(
             session, prompt, strategy="out_of_box",
             mode_for_route="out_of_box",
             parent_ids=[h.id for h in inspirations],
         )
+
+    def _load_creative_works(self, session_id: str) -> list[dict[str, str]]:
+        """ALL creative warm-ups written during this session — divergence fuel.
+
+        Poems/stories are written in the same context that produced each
+        hypothesis; they carry associations that never made it into the
+        structured fields. No cap: every creative work feeds out_of_box.
+        """
+        creative_dir = self.deps.cfg.session_artifact_dir(session_id) / "creative"
+        out: list[dict[str, str]] = []
+        if not creative_dir.is_dir():
+            return out
+        for p in sorted(creative_dir.glob("*.md")):
+            try:
+                out.append({"id": p.stem, "text": p.read_text(encoding="utf-8")})
+            except OSError:
+                continue
+        return out
 
     async def _unary(
         self, session, top: list[Hypothesis], *, strategy: EvoStrategy
@@ -161,6 +180,12 @@ class EvolutionAgent(BaseAgent):
                 cache=True,
             ),
         ]
+        survey = self._field_context_block(tools_note=(
+            "Offspring hypotheses must stay consistent with this background; "
+            "use the search tools only for gaps the survey leaves open."
+        ))
+        if survey is not None:
+            sys_blocks.append(survey)
         user_blocks = [CachedBlock(prompt, cache=False)]
 
         r = route(self.deps.cfg, "evolution", mode_for_route)
@@ -217,10 +242,6 @@ class EvolutionAgent(BaseAgent):
         summary = (record.get("statement") or "") + "\n\n" + (record.get("mechanism") or "")
         full_text = _render_hypothesis_md(record)
 
-        artifact_path = await write_json(
-            self.deps.cfg, session_id, "hypotheses", hid,
-            {"strategy": strategy, "record": record},
-        )
         citations = [
             CitedPaper(
                 title=c.get("title", ""), url=c.get("url", ""),
@@ -230,15 +251,32 @@ class EvolutionAgent(BaseAgent):
             if isinstance(c, dict) and c.get("url")
         ]
 
-        # Dedup: cheap nearest-neighbour query. Same pattern as Generation.
+        # Dedup BEFORE artifact writes. Same pattern as Generation — and an
+        # offspring is NEVER deduped against its own parent: a simplify child
+        # resembles its parent by design and competes in the tournament instead.
         try:
-            dup_id, embed_payload = await self._dedup_query(session_id, summary)
+            dup_id, similarity, embed_payload = await self._dedup_query(session_id, summary)
         except Exception as e:
             log.warning("evolution_dedup_query_failed", err=str(e))
-            dup_id, embed_payload = None, None
+            dup_id, similarity, embed_payload = None, None, None
 
-        if dup_id is not None and dup_id != hid:
+        parents = set(record.get("parent_ids") or [])
+        if dup_id is not None and dup_id != hid and dup_id not in parents:
+            await self._record_discard(
+                session_id, hid, record,
+                strategy=strategy, duplicate_of=dup_id, similarity=similarity,
+            )
             return dup_id, False
+
+        artifact_path = await write_json(
+            self.deps.cfg, session_id, "hypotheses", hid,
+            {"strategy": strategy, "record": record},
+        )
+        creative = (record.get("creative_work") or "").strip()
+        if creative:
+            await write_text(
+                self.deps.cfg, session_id, "creative", hid, ".md", creative
+            )
 
         h = Hypothesis(
             id=hid, session_id=session_id, created_at=datetime.now(UTC),
@@ -265,27 +303,28 @@ class EvolutionAgent(BaseAgent):
 
     async def _dedup_query(
         self, session_id: str, text: str
-    ) -> tuple[str | None, dict[str, Any] | None]:
+    ) -> tuple[str | None, float | None, dict[str, Any] | None]:
         try:
             embedder = make_embedder(self.deps.cfg)
         except (RuntimeError, ValueError):
-            return None, None
+            return None, None, None
         vec = await embedder.embed([text])
         if vec.size == 0:
-            return None, None
+            return None, None, None
         v = vec[0]
         store = FaissStore(self.deps.cfg, session_id, dim=embedder.dim)
         await store.load_or_create()
         nearest = await store.search(np.asarray(v), k=1)
         thr = self.deps.cfg.vectors.dedup_cosine_threshold
-        if nearest and nearest[0][1] >= thr:
-            return nearest[0][0], None
-        return None, {
+        payload = {
             "vector": np.asarray(v),
             "model": embedder.model,
             "dim": embedder.dim,
             "text_hash": ids.text_hash(text),
         }
+        if nearest and nearest[0][1] >= thr:
+            return nearest[0][0], float(nearest[0][1]), payload
+        return None, None, payload
 
     async def _dedup_commit(
         self, session_id: str, hypothesis_id: str, payload: dict[str, Any]
@@ -340,8 +379,8 @@ class EvolutionAgent(BaseAgent):
         return rs_sorted[0].body
 
     async def _latest_feedback(self, session_id: str) -> str | None:
-        fb = await fb_repo.latest_system_feedback(self.deps.db, session_id)
-        return fb.text if fb is not None else None
+        """Composed pull: all active human directives + latest meta-review steering."""
+        return await fb_repo.composed_feedback(self.deps.db, session_id)
 
 
 # ----------------------------- formatting helpers ----------------------------- #

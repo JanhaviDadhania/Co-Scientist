@@ -114,6 +114,10 @@ class RankingAgent(BaseAgent):
                 elo_a_before=hyp_a.elo or 1200.0, elo_b_before=hyp_b.elo or 1200.0,
                 rationale=rationale, transcript_id=transcript_id, similarity=similarity,
             ))
+            await self._write_match_artifact(
+                session.id, mid_invalid, hyp_a, hyp_b, mode="invalid",
+                winner=None, rationale=rationale,
+            )
             log.warning("ranking_invalid_verdict", a=hyp_a.id, b=hyp_b.id)
             return TaskResult(kind="noop", extra={"reason": "unparseable verdict"})
 
@@ -142,6 +146,11 @@ class RankingAgent(BaseAgent):
             match_id=mid, hyp_a=hyp_a.id, hyp_b=hyp_b.id, winner=verdict,
             elo_a_before=elo_a_before, elo_b_before=elo_b_before,
             elo_a_after=upd.elo_a_after, elo_b_after=upd.elo_b_after,
+        )
+        await self._write_match_artifact(
+            session.id, mid, hyp_a, hyp_b, mode=mode, winner=verdict,
+            rationale=rationale,
+            elo_after=(upd.elo_a_after, upd.elo_b_after),
         )
         log.info(
             "match_complete",
@@ -303,8 +312,11 @@ class RankingAgent(BaseAgent):
         mode: PairMode,
     ) -> tuple[Literal["a", "b"] | None, str, str | None]:
         plan = session.research_plan
-        # Anchor on the lower-ID hypothesis so cache hits cluster on it.
-        anchor, opponent = (a, b) if a.id <= b.id else (b, a)
+        # Presentation order is RANDOMIZED per match. The previous lower-ID
+        # anchoring (for cache hits) froze a position bias: the same
+        # hypothesis sat in slot 1 across ALL its rematches, so the bias was
+        # correlated and never washed out. Cache savings aren't worth that.
+        anchor, opponent = (a, b) if random.random() < 0.5 else (b, a)
         anchor_is_a = anchor is a
         review_anchor = await self._best_review(anchor.id)
         review_opp = await self._best_review(opponent.id)
@@ -336,6 +348,13 @@ class RankingAgent(BaseAgent):
                 cache=True,
             ),
         ]
+        survey = self._field_context_block(tools_note=(
+            "Judge both hypotheses against this background — a hypothesis "
+            "that contradicts or ignores the surveyed state of the field "
+            "should lose unless it argues the contradiction explicitly."
+        ))
+        if survey is not None:
+            system.append(survey)
         spec = AgentCallSpec(
             route=r,
             system_blocks=system,
@@ -370,6 +389,47 @@ class RankingAgent(BaseAgent):
         # Prefer 'full' kind if present.
         rs_sorted = sorted(rs, key=lambda r: (r.kind != "full", -(r.scores.novelty or 0)))
         return rs_sorted[0].body
+
+    async def _write_match_artifact(
+        self,
+        session_id: str,
+        match_id: str,
+        hyp_a: Hypothesis,
+        hyp_b: Hypothesis,
+        *,
+        mode: str,
+        winner: str | None,
+        rationale: str,
+        elo_after: tuple[float, float] | None = None,
+    ) -> None:
+        """Save the match verdict + full rationale as a readable matches/ file.
+
+        The best reasoning in the system shouldn't live only in SQLite rows.
+        """
+        from ..storage.artifacts import write_text
+
+        winner_id = (
+            hyp_a.id if winner == "a" else hyp_b.id if winner == "b" else None
+        )
+        lines = [
+            f"# Match `{match_id}` ({mode})",
+            "",
+            f"- A: `{hyp_a.id}` — {hyp_a.title}",
+            f"- B: `{hyp_b.id}` — {hyp_b.title}",
+            f"- Winner: {f'`{winner_id}`' if winner_id else '(invalid / unparseable verdict)'}",
+        ]
+        if elo_after is not None:
+            lines.append(
+                f"- Elo after: A {elo_after[0]:.0f} · B {elo_after[1]:.0f}"
+            )
+        lines += ["", "## Rationale", "", rationale or "(empty)"]
+        try:
+            await write_text(
+                self.deps.cfg, session_id, "matches", match_id, ".md",
+                "\n".join(lines),
+            )
+        except Exception as e:  # noqa: BLE001 — artifact write must not kill the match
+            log.warning("match_artifact_write_failed", match_id=match_id, err=str(e))
 
 
 _VERDICT_DIGIT_RE = re.compile(r"^[\W_]*\**\s*([12])\b")

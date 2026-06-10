@@ -22,6 +22,9 @@ class ResearchPlan(BaseModel):
     idea_attributes: list[str] = Field(default_factory=list)
     domain_hint: str | None = None         # e.g. "biology", "chemistry"; informational only
     notes: str | None = None
+    # How many hypotheses this run should generate. Derived from the
+    # discussion by ParseGoal (default 15), overridable via --n.
+    n_ideas: int = 15
 
 
 class Session(BaseModel):

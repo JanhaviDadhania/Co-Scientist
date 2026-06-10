@@ -8,6 +8,7 @@ from typing import Any
 import aiosqlite
 
 from ..config import Config
+from ..llm.anthropic_client import CachedBlock
 from ..llm.provider import LLMProvider
 from ..models import Task, TaskResult
 from ..safety.quoting import SAFETY_PREAMBLE
@@ -41,6 +42,72 @@ class BaseAgent:
         return (
             f"You are the {self.name} agent in a multi-agent scientific research system. "
             f"Operate carefully and cite your sources. {SAFETY_PREAMBLE}"
+        )
+
+    def _field_context_block(self, *, tools_note: str | None = None) -> CachedBlock | None:
+        """The curated field survey as a cacheable context block.
+
+        The same block (same text → same cache entry) travels to every agent
+        so the survey grounds Generation, Reflection, Ranking, Evolution, and
+        Meta-review alike — not just the first hop.
+        """
+        fc = (self.deps.cfg.run.field_context or "").strip()
+        if not fc:
+            return None
+        extra = f"\n\n{tools_note}" if tools_note else ""
+        return CachedBlock(
+            "# Field background — required reading\n\n"
+            "A curated survey of the field this session investigates is "
+            "provided below. Ground your reasoning and judgments in it; if it "
+            f"covers a topic, trust it and cite it.{extra}\n\n"
+            "--- BEGIN SURVEY ---\n"
+            f"{fc}\n"
+            "--- END SURVEY ---",
+            cache=True,
+        )
+
+    async def _record_discard(
+        self,
+        session_id: str,
+        hypothesis_id: str,
+        record: dict[str, Any],
+        *,
+        strategy: str,
+        duplicate_of: str,
+        similarity: float | None,
+    ) -> None:
+        """Make a dedup rejection visible: discarded/ artifact + event.
+
+        Nothing the LLM generates is ever lost silently — the full record
+        lands in discarded/ with the duplicate-of id and similarity, and an
+        event marks that it happened.
+        """
+        from ..storage.artifacts import write_json
+        from ..storage.repos import events as events_repo
+
+        path: str | None = None
+        try:
+            path = await write_json(
+                self.deps.cfg, session_id, "discarded", hypothesis_id,
+                {
+                    "reason": "near_duplicate",
+                    "duplicate_of": duplicate_of,
+                    "similarity": similarity,
+                    "strategy": strategy,
+                    "record": record,
+                },
+            )
+        except Exception:  # noqa: BLE001 — the event below still fires
+            pass
+        await events_repo.emit(
+            self.deps.db, session_id=session_id, task_id=None, agent=self.name,
+            event="hypothesis_deduped",
+            payload={
+                "hypothesis_id": hypothesis_id,
+                "duplicate_of": duplicate_of,
+                "similarity": similarity,
+                "artifact_path": path,
+            },
         )
 
     @staticmethod

@@ -54,6 +54,7 @@ from .budgets import TokenBudget
 from .openai_client import _Block, _Message, _Usage
 from .retry import RetryPolicy
 from .routing import estimate_cost_usd
+from .schema_validate import validate_payload
 
 CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
 DEFAULT_TIMEOUT_S = int(os.environ.get("CLAUDE_CODE_TIMEOUT_S", "400"))
@@ -79,6 +80,9 @@ class ClaudeCodeClient:
         self._budget = budget
         self._timeout_s = DEFAULT_TIMEOUT_S
 
+    # Total attempts for a forced tool call: 1 initial + 2 validation retries.
+    MAX_FORCED_TOOL_ATTEMPTS = 3
+
     async def call(
         self,
         spec: AgentCallSpec,
@@ -86,8 +90,6 @@ class ClaudeCodeClient:
         *,
         est_input_tokens: int | None = None,
     ) -> AnthropicResponse:
-        system_text, user_text, json_schema, forced_tool_name, tempfile_path = self._build_prompts(spec)
-
         est_in = est_input_tokens or _rough_token_count(spec)
         est_out = spec.max_output_tokens
         est_cost = estimate_cost_usd(
@@ -100,39 +102,123 @@ class ClaudeCodeClient:
         started = datetime.now(UTC)
         t0 = time.monotonic()
 
+        total_in = 0
+        total_out = 0
+        attempts_log: list[dict[str, Any]] = []
+        message: _Message | None = None
+        forced_tool_name: str | None = None
+        json_schema: dict | None = None
+        validation_errors: list[str] = []
+
         try:
-            raw = await self._invoke(
-                system_text,
-                user_text,
-                model=spec.route.model,
-                json_schema=json_schema,
-                use_write_tool=tempfile_path is not None,
-            )
+            for attempt in range(self.MAX_FORCED_TOOL_ATTEMPTS):
+                # New prompts (and a fresh tempfile path) per attempt.
+                system_text, user_text, json_schema, forced_tool_name, tempfile_path = (
+                    self._build_prompts(spec)
+                )
+                if validation_errors:
+                    user_text += (
+                        "\n\n=== PREVIOUS ATTEMPT FAILED VALIDATION ===\n"
+                        f"Your previous reply did not produce a valid "
+                        f"`{forced_tool_name}` payload:\n"
+                        + "\n".join(f"- {e}" for e in validation_errors)
+                        + "\nUse the Write tool to write the CORRECTED raw-JSON "
+                        "payload to the file path given in the system prompt. "
+                        "Fix every error listed above."
+                    )
+
+                try:
+                    raw = await self._invoke(
+                        system_text,
+                        user_text,
+                        model=spec.route.model,
+                        # The file carries the payload; never constrain stdout.
+                        json_schema=None,
+                        use_write_tool=tempfile_path is not None,
+                    )
+                except BaseException:
+                    self._cleanup_tempfile(tempfile_path)
+                    raise
+
+                file_data = self._read_and_cleanup_tempfile(tempfile_path)
+                message = self._adapt(
+                    raw,
+                    spec.route.model,
+                    forced_tool_name=forced_tool_name,
+                    has_tools=bool(spec.tools),
+                    file_data=file_data,
+                    forced_tool_schema=json_schema,
+                    tools=spec.tools,
+                )
+                total_in += message.usage.input_tokens
+                total_out += message.usage.output_tokens
+                attempts_log.append({
+                    "attempt": attempt + 1,
+                    "request": {
+                        "system": system_text,
+                        "prompt": user_text,
+                        "json_schema": json_schema,
+                        "model": spec.route.model,
+                        "forced_tool_name": forced_tool_name,
+                    },
+                    "response": {"raw": raw, "message": message.model_dump()},
+                })
+
+                if forced_tool_name is None:
+                    break
+
+                payload = None
+                for b in message.content:
+                    if (
+                        getattr(b, "type", None) == "tool_use"
+                        and getattr(b, "name", "") == forced_tool_name
+                    ):
+                        payload = getattr(b, "input", None)
+                if payload is None:
+                    validation_errors = [
+                        f"no `{forced_tool_name}` payload was found — the JSON "
+                        f"file was missing, empty, or unparseable"
+                    ]
+                    continue
+                validation_errors = validate_payload(json_schema, payload)
+                if not validation_errors:
+                    break
+
+            if forced_tool_name is not None and validation_errors:
+                raise ClaudeCodeError(
+                    f"forced tool {forced_tool_name!r} failed validation after "
+                    f"{len(attempts_log)} attempt(s): {'; '.join(validation_errors[:8])}"
+                )
         except BaseException:
-            self._cleanup_tempfile(tempfile_path)
+            # Settle with whatever was actually consumed, persist the attempt
+            # transcripts (save everything), then propagate loudly.
+            cost = estimate_cost_usd(
+                model=spec.route.model, input_tokens=total_in, output_tokens=total_out
+            )
             await self._budget.settle(
                 ctx.agent,
                 est_tokens=est_in + est_out,
                 est_usd=est_cost,
-                actual_input_tokens=0,
-                actual_output_tokens=0,
-                actual_usd=0.0,
+                actual_input_tokens=total_in,
+                actual_output_tokens=total_out,
+                actual_usd=cost,
             )
+            if attempts_log:
+                try:
+                    await self._record_transcript(
+                        ctx, spec, attempts_log, started, t0,
+                        in_tok=total_in, out_tok=total_out, cost_usd=cost,
+                    )
+                except Exception:  # noqa: BLE001 — never mask the original error
+                    pass
             raise
-        finished = datetime.now(UTC)
 
-        file_data = self._read_and_cleanup_tempfile(tempfile_path)
-        message = self._adapt(
-            raw,
-            spec.route.model,
-            forced_tool_name=forced_tool_name,
-            has_tools=bool(spec.tools),
-            file_data=file_data,
-            forced_tool_schema=json_schema,
-            tools=spec.tools,
-        )
-        in_tok = message.usage.input_tokens
-        out_tok = message.usage.output_tokens
+        assert message is not None
+        finished = datetime.now(UTC)
+        _ = finished
+
+        in_tok = total_in
+        out_tok = total_out
         cost_usd = estimate_cost_usd(
             model=spec.route.model, input_tokens=in_tok, output_tokens=out_tok
         )
@@ -146,17 +232,41 @@ class ClaudeCodeClient:
             actual_usd=cost_usd,
         )
 
+        trn_id, artifact_path = await self._record_transcript(
+            ctx, spec, attempts_log, started, t0,
+            in_tok=in_tok, out_tok=out_tok, cost_usd=cost_usd,
+        )
+
+        _ = artifact_path
+        return AnthropicResponse(
+            raw=message,
+            transcript_id=trn_id,
+            cost_usd=cost_usd,
+            input_tokens=in_tok,
+            output_tokens=out_tok,
+            cache_read=0,
+            cache_write=0,
+        )
+
+    async def _record_transcript(
+        self,
+        ctx: CallContext,
+        spec: AgentCallSpec,
+        attempts_log: list[dict[str, Any]],
+        started: datetime,
+        t0: float,
+        *,
+        in_tok: int,
+        out_tok: int,
+        cost_usd: float,
+    ) -> tuple[str, str]:
+        """Write the full multi-attempt transcript artifact + DB row."""
+        finished = datetime.now(UTC)
         trn_id = transcript_id()
         artifact = {
             "provider": "claude_code",
-            "request": {
-                "system": system_text,
-                "prompt": user_text,
-                "json_schema": json_schema,
-                "model": spec.route.model,
-                "forced_tool_name": forced_tool_name,
-            },
-            "response": {"raw": raw, "message": message.model_dump()},
+            "n_attempts": len(attempts_log),
+            "attempts": attempts_log,
             "started_at": started.isoformat(),
             "finished_at": finished.isoformat(),
             "duration_ms": int((time.monotonic() - t0) * 1000),
@@ -164,7 +274,6 @@ class ClaudeCodeClient:
         artifact_path = await write_json(
             self._cfg, ctx.session_id, f"transcripts/{ctx.agent}", trn_id, artifact
         )
-
         t = Transcript(
             id=trn_id,
             session_id=ctx.session_id,
@@ -185,16 +294,7 @@ class ClaudeCodeClient:
         await sessions_repo.add_usage(
             self._db, ctx.session_id, in_tok + out_tok, cost_usd
         )
-
-        return AnthropicResponse(
-            raw=message,
-            transcript_id=trn_id,
-            cost_usd=cost_usd,
-            input_tokens=in_tok,
-            output_tokens=out_tok,
-            cache_read=0,
-            cache_write=0,
-        )
+        return trn_id, artifact_path
 
     # ------------------------- prompt construction ------------------------ #
 
@@ -223,43 +323,37 @@ class ClaudeCodeClient:
                     if tool.get("name") == forced_tool_name:
                         schema = tool.get("input_schema") or {"type": "object"}
                         json_schema = schema
-                        # Markdown-on-stdout path. No Write tool, no tempfile.
-                        # The model writes a structured markdown answer to stdout;
-                        # we parse it on the way out (see `_parse_markdown_payload`).
-                        tempfile_path = None
-                        template = self._build_markdown_template(forced_tool_name, schema)
+                        # FILE HANDSHAKE: the model commits by Writing the JSON
+                        # payload to a per-call tempfile. Write is Claude Code's
+                        # most-practiced native tool — far more reliable than
+                        # coercing structured output onto stdout. The wrapper
+                        # reads the file back, validates it against the schema,
+                        # and retries with the exact errors on failure.
+                        tempfile_path = (
+                            Path(tempfile.gettempdir())
+                            / f"co_scientist_{uuid.uuid4().hex}.json"
+                        )
                         system_parts.append(
-                            f"=====================================================\n"
-                            f"HARD CONSTRAINT — STRUCTURED MARKDOWN ANSWER REQUIRED\n"
-                            f"=====================================================\n\n"
-                            f"The end of your stdout response is parsed by automated "
-                            f"downstream agents. They look for the markers shown below "
-                            f"and extract one section per property of the tool "
-                            f"'{forced_tool_name}'. Anything before BEGIN ANSWER is "
-                            f"ignored; anything after END ANSWER is ignored. There is no "
-                            f"human review and no retry.\n\n"
-                            f"You do not need to call any tool. You do not need to emit "
-                            f"JSON. You only need to end your response with the exact "
-                            f"template below, with the placeholder text replaced by your "
-                            f"real content.\n\n"
-                            f"REQUIRED FORMAT — copy this template, replace placeholders, "
-                            f"keep every '## <name>' header verbatim:\n\n"
-                            f"=== BEGIN ANSWER ===\n"
-                            f"{template}\n"
-                            f"=== END ANSWER ===\n\n"
-                            f"RULES:\n"
-                            f"  - every '## <property>' header must appear exactly once "
-                            f"(case and spelling matter for matching).\n"
-                            f"  - array properties use '- ' bullet lines, one item per line.\n"
-                            f"  - array-of-objects properties use '### <label>' sub-headers, "
-                            f"with one '- key: value' line per inner field.\n"
-                            f"  - keep the BEGIN/END ANSWER markers verbatim — they are "
-                            f"what bounds the parsed region.\n"
-                            f"  - put exactly ONE answer between the markers (you are "
-                            f"committing one record, not many).\n\n"
-                            f"(For reference, the tool's full JSON schema is below — "
-                            f"types and required-ness come from this. You do NOT need to "
-                            f"emit JSON; just fill the markdown template above.)\n\n"
+                            f"==================================================\n"
+                            f"HARD CONSTRAINT — COMMIT VIA FILE WRITE\n"
+                            f"==================================================\n\n"
+                            f"You must call the tool '{forced_tool_name}'. In this "
+                            f"environment you do that by WRITING A FILE: use your "
+                            f"Write tool to create the file\n\n"
+                            f"    {tempfile_path}\n\n"
+                            f"containing EXACTLY ONE JSON object — the arguments "
+                            f"payload for '{forced_tool_name}'. The file must be raw "
+                            f"JSON: no markdown fences, no commentary, nothing else.\n\n"
+                            f"Automated code reads that file and VALIDATES it against "
+                            f"the JSON schema below. If the file is missing or the "
+                            f"payload is invalid you will be re-invoked with the "
+                            f"validation errors; after repeated failures the pipeline "
+                            f"halts.\n\n"
+                            f"After writing the file, end your reply with the single "
+                            f"line:\n"
+                            f"COMMITTED {forced_tool_name}\n\n"
+                            f"JSON schema for the payload (types and required fields "
+                            f"are enforced):\n"
                             f"{json.dumps(schema, default=str)}"
                         )
                         break
@@ -270,10 +364,12 @@ class ClaudeCodeClient:
                     system_parts.append(
                         "You MUST call exactly one of the tools listed above."
                     )
-                # Two output formats — JSON tool_calls for cheap tools, markdown
-                # for "record_*" tools (commit-style, large structured payloads).
-                # The markdown path is much more reliable than coercing the model
-                # to emit a multi-paragraph JSON object on stdout.
+                # Two output formats — JSON tool_calls on stdout for cheap
+                # search/lookup tools, and the FILE HANDSHAKE for "record_*"
+                # commit tools (large structured payloads): the model Writes
+                # the payload JSON to a per-call tempfile, which is far more
+                # reliable than emitting a multi-paragraph JSON object or a
+                # fragile markdown template on stdout.
                 record_tools = [
                     t for t in spec.tools
                     if (t.get("name") or "").startswith("record_")
@@ -284,28 +380,37 @@ class ClaudeCodeClient:
                     '{"tool_calls": [{"name": "<tool_name>", "arguments": {<args matching that tool\'s input_schema>}}]}\n'
                     'If you do not want to call any tool, respond with plain text.'
                 )
-                for t in record_tools:
-                    rname = t["name"]
-                    rschema = t.get("input_schema") or {"type": "object"}
-                    tmpl = self._build_markdown_template(rname, rschema)
+                if record_tools:
+                    tempfile_path = (
+                        Path(tempfile.gettempdir())
+                        / f"co_scientist_{uuid.uuid4().hex}.json"
+                    )
+                    names = ", ".join(f"`{t['name']}`" for t in record_tools)
+                    schemas_block = "\n\n".join(
+                        f"### {t['name']}\n"
+                        f"{json.dumps(t.get('input_schema') or {}, default=str)}"
+                        for t in record_tools
+                    )
                     system_parts.append(
                         f"------------------------------------------------------\n"
-                        f"SPECIAL CASE — calling `{rname}` (structured-commit tool)\n"
+                        f"SPECIAL CASE — committing via {names} (structured-commit)\n"
                         f"------------------------------------------------------\n\n"
-                        f"`{rname}` is a structured-commit tool with a large multi-field "
-                        f"payload. For this specific tool, DO NOT use the `{{tool_calls: [...]}}` "
-                        f"JSON format above — JSON-escaping a multi-paragraph payload is "
-                        f"error-prone. Instead, end your stdout response with the markdown "
-                        f"template below. Downstream code parses this markdown into the "
-                        f"tool's structured payload automatically.\n\n"
-                        f"To commit to `{rname}`, append this to the end of your response "
-                        f"(keep BEGIN/END markers verbatim, fill placeholders with your content):\n\n"
-                        f"=== BEGIN ANSWER ===\n"
-                        f"{tmpl}\n"
-                        f"=== END ANSWER ===\n\n"
-                        f"Use this markdown form for `{rname}` ONLY. Do not mix it with "
-                        f"`{{tool_calls: [...]}}` JSON. If you want to call a search tool "
-                        f"instead this turn, use the JSON form and skip the markdown."
+                        f"These commit tools carry large multi-field payloads. Do "
+                        f"NOT use the `{{\"tool_calls\": [...]}}` JSON format for "
+                        f"them and do NOT print the payload to stdout. Instead, "
+                        f"when you are ready to commit, use your Write tool to "
+                        f"create the file\n\n"
+                        f"    {tempfile_path}\n\n"
+                        f"containing exactly one JSON object of the form:\n"
+                        f'{{"tool": "<commit tool name>", "payload": {{ ...arguments '
+                        f"matching that tool's input_schema... }}}}\n\n"
+                        f"The file must be raw JSON — no markdown fences, no "
+                        f"commentary. After writing it, end your reply with the "
+                        f"single line:\n"
+                        f"COMMITTED <commit tool name>\n\n"
+                        f"If you want to call a search tool instead this turn, use "
+                        f"the JSON form above and do not write the file.\n\n"
+                        f"Payload schemas:\n{schemas_block}"
                     )
 
         system_text = "\n\n".join(p for p in system_parts if p).strip()
@@ -456,13 +561,23 @@ class ClaudeCodeClient:
         tool_used = False
 
         if forced_tool_name:
-            # Primary: parse structured markdown the model wrote on stdout.
-            # That's the format the system prompt now asks for. Fallbacks below
-            # (file_data, JSON-in-text) cover legacy paths if any caller still
-            # passes a tempfile or the model happens to emit JSON anyway.
-            args_obj = self._parse_markdown_payload(text, forced_tool_schema)
-            if args_obj is None and isinstance(file_data, (dict, list)):
+            # Primary: the FILE HANDSHAKE — the model Wrote the payload JSON to
+            # a per-call tempfile and `file_data` carries it. Fallbacks (markdown
+            # sections, JSON-in-text) cover models that answered on stdout
+            # anyway; the validation+retry loop in `call()` is the gate that
+            # decides whether whatever we recovered is actually acceptable.
+            args_obj: Any | None = None
+            if isinstance(file_data, dict):
+                # Tolerate the {"tool": ..., "payload": ...} wrapper used by
+                # the auto-path instructions even in forced mode.
+                if isinstance(file_data.get("payload"), dict) and "tool" in file_data:
+                    args_obj = file_data["payload"]
+                else:
+                    args_obj = file_data
+            elif isinstance(file_data, list):
                 args_obj = file_data
+            if args_obj is None:
+                args_obj = self._parse_markdown_payload(text, forced_tool_schema)
             if args_obj is None:
                 args_obj = self._parse_json_object(text)
             if args_obj is not None:
@@ -478,8 +593,32 @@ class ClaudeCodeClient:
             else:
                 blocks.append(_Block(type="text", text=text))
         elif has_tools:
-            tcs = self._extract_tool_calls(text)
-            if tcs:
+            # FILE HANDSHAKE first: a record_* commit Written to the tempfile.
+            if isinstance(file_data, dict):
+                name: str | None = None
+                payload: dict | None = None
+                if "tool" in file_data and isinstance(file_data.get("payload"), dict):
+                    name = str(file_data["tool"])
+                    payload = file_data["payload"]
+                else:
+                    # Bare payload: attribute it to the agent's single record_* tool.
+                    record_names = [
+                        t.get("name") or "" for t in (tools or [])
+                        if (t.get("name") or "").startswith("record_")
+                    ]
+                    if len(record_names) == 1:
+                        name, payload = record_names[0], file_data
+                if name and payload is not None:
+                    blocks.append(_Block(
+                        type="tool_use",
+                        id=f"call_{uuid.uuid4().hex[:12]}",
+                        name=name,
+                        input=payload,
+                    ))
+                    tool_used = True
+            if tool_used:
+                pass
+            elif (tcs := self._extract_tool_calls(text)):
                 for tc in tcs:
                     args = tc.get("arguments") or {}
                     if not isinstance(args, dict):
